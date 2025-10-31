@@ -23,9 +23,6 @@ try:
 except Exception:
     YouTubeTranscriptApi = None  # degrade gracefully
 
-# (Optional) yt-dlp installed via requirements for future RSS/MP3 support
-# import yt_dlp  # not used yet
-
 # ---- Prompts (from prompts.py) ----
 try:
     from prompts import build_persona_prompt
@@ -38,16 +35,15 @@ except Exception as e:
 # =========================
 st.set_page_config(page_title="RoadScout: Podcast Summarizer", page_icon="🎧", layout="wide")
 st.title("🎧 RoadScout: Podcast Summarizer")
-st.caption("Paste a podcast or YouTube URL, fetch transcript (when available), get a persona-driven summary, and play an audio summary.")
+st.caption("Paste a podcast/YouTube URL (or transcript), click once, and get a persona-driven text + audio summary.")
 
 # =========================
 # Secrets / API Key
 # =========================
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-st.caption("🔐 Secrets OK") if OPENAI_API_KEY else st.error("No OPENAI_API_KEY detected")
 if not OPENAI_API_KEY:
+    st.error("No OPENAI_API_KEY detected. Add it in Streamlit → Settings → Secrets.")
     st.stop()
-
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
@@ -69,7 +65,7 @@ def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = Non
     - Return (joined_text, timeline [(start_seconds, text), ...])
     """
     if YouTubeTranscriptApi is None:
-        raise RuntimeError("youtube-transcript-api is not installed.")
+        raise RuntimeError("youtube-transcript-api is not installed on this deployment.")
     languages = languages or ["en", "en-US", "en-GB"]
 
     try:
@@ -133,18 +129,20 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
 def summarize_transcript(transcript: str,
                          persona_prompt: str,
                          model: str = "gpt-4o-mini",
-                         temperature: float = 0.2) -> str:
+                         temperature: float = 0.2,
+                         log=None) -> str:
     """
     Sends chunked transcript to the model with a system+user flow:
     - system: persona_prompt
     - user: chunk i
     Then merges with a final pass.
     """
-    # 1) Per-chunk intermediate summaries
     chunks = chunk_text(transcript, max_chars=12000)
+    if log: log(f"Transcript length: {len(transcript):,} chars → {len(chunks)} chunk(s).")
     intermediates: List[str] = []
 
     for i, ch in enumerate(chunks, 1):
+        if log: log(f"Summarizing chunk {i}/{len(chunks)} ({len(ch):,} chars)…")
         messages = [
             {"role": "system", "content": persona_prompt},
             {"role": "user", "content": f"TRANSCRIPT CHUNK {i}/{len(chunks)}:\n\n{ch}\n\nProvide a compact intermediate summary (bulleted where helpful)."}
@@ -156,7 +154,7 @@ def summarize_transcript(transcript: str,
         )
         intermediates.append(resp.choices[0].message.content.strip())
 
-    # 2) Merge pass
+    if log: log("Merging intermediate summaries…")
     merge_messages = [
         {"role": "system", "content": persona_prompt},
         {"role": "user", "content": "Merge the following intermediate summaries into a single cohesive final report. Remove redundancies, keep structure, and ensure chronology and lenses are clear:\n\n" + "\n\n---\n\n".join(intermediates)}
@@ -168,50 +166,36 @@ def summarize_transcript(transcript: str,
     )
     return final_resp.choices[0].message.content.strip()
 
-def timeline_with_timestamps(tl: List[Tuple[float, str]]) -> str:
-    """Utility for showing a simple preview of fetched transcript with timestamps."""
-    preview_lines = []
-    for start, text in tl[:40]:  # limit preview
-        mm = int(start // 60)
-        ss = int(start % 60)
-        preview_lines.append(f"[{mm:02d}:{ss:02d}] {text}")
-    if len(tl) > 40:
-        preview_lines.append("... (truncated preview)")
-    return "\n".join(preview_lines)
-
 def tts_from_text(text: str,
                   model: str = "gpt-4o-mini-tts",
                   voice: str = "alloy",
-                  max_chars: int = 8000) -> bytes:
-    """
-    Create an MP3 from text using OpenAI TTS.
-    Truncates input defensively to avoid very long TTS jobs on Cloud runtimes.
-    """
+                  max_chars: int = 8000,
+                  log=None) -> bytes:
+    """Create an MP3 from text using OpenAI TTS. Truncates to keep it snappy on Cloud."""
     safe = text.strip()
     if len(safe) > max_chars:
+        if log: log(f"TTS truncating from {len(safe):,} → {max_chars:,} chars for faster playback.")
         safe = safe[:max_chars] + "\n\n[...truncated for audio length...]"
-
     try:
-        # Preferred new TTS
-        resp = client.audio.speech.create(
-            model=model,
-            voice=voice,
-            input=safe,
-            format="mp3",
-        )
-        return resp.read()  # bytes
-    except Exception:
-        # Fallback to tts-1 if mini-tts isn’t available
-        resp = client.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=safe,
-            format="mp3",
-        )
+        if log: log(f"TTS model={model}, voice={voice}")
+        resp = client.audio.speech.create(model=model, voice=voice, input=safe, format="mp3")
+        return resp.read()
+    except Exception as e:
+        if log: log(f"TTS fallback (tts-1): {e}")
+        resp = client.audio.speech.create(model="tts-1", voice=voice, input=safe, format="mp3")
         return resp.read()
 
+def timeline_preview(tl: List[Tuple[float, str]]) -> str:
+    lines = []
+    for start, text in tl[:40]:
+        mm = int(start // 60); ss = int(start % 60)
+        lines.append(f"[{mm:02d}:{ss:02d}] {text}")
+    if len(tl) > 40:
+        lines.append("… (truncated)")
+    return "\n".join(lines)
+
 # =========================
-# UI
+# UI – one-click flow
 # =========================
 with st.sidebar:
     st.subheader("Summary Settings")
@@ -220,109 +204,110 @@ with st.sidebar:
         ["clear and professional", "friendly and concise", "analytical and direct", "executive brief"],
         index=2
     )
-    target_minutes = st.slider("Target read length (minutes)", min_value=5, max_value=25, value=12, step=1)
+    target_minutes = st.slider("Target read length (minutes)", 5, 25, 12, 1)
     include_ts = st.checkbox("Include timestamps when possible", value=True)
-    extra_focus = st.text_input("Optional: extra focus areas (comma-separated)", value="regulatory risk, compute constraints")
+    extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
     model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"], index=0)
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
+    tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)
 
-url = st.text_input("Paste podcast / episode URL (YouTube works best for auto-transcript):").strip()
-st.write("— or —")
-manual = st.text_area("Paste transcript manually (if no transcript can be fetched):", height=200)
+# Single input + single button = single action
+url = st.text_input("Paste podcast / episode URL (YouTube best for auto-transcript):").strip()
+manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=160)
 
-colA, colB = st.columns([1, 1])
-with colA:
-    fetch_btn = st.button("Fetch Transcript (from URL)")
-with colB:
-    summarize_btn = st.button("Summarize")
+go = st.button("Summarize & Play ▶️")
 
-transcript_text: Optional[str] = None
-timeline: Optional[List[Tuple[float, str]]] = None
+# Simple in-app logger
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+def log(msg: str):
+    st.session_state.logs.append(msg)
 
-# ============ Fetch transcript flow ============
-if fetch_btn:
-    if not url:
-        st.warning("Please paste a URL first.")
-    else:
-        yt_id = extract_youtube_id(url)
-        if yt_id:
-            try:
-                with st.spinner("Fetching YouTube transcript..."):
-                    transcript_text, timeline = fetch_youtube_transcript(yt_id)
-                st.success("Transcript fetched successfully.")
-                with st.expander("Transcript Preview (first ~40 entries)"):
-                    st.code(timeline_with_timestamps(timeline))
-                with st.expander("Raw Transcript (joined)"):
-                    st.write(transcript_text[:4000] + ("..." if len(transcript_text) > 4000 else ""))
-            except (TranscriptsDisabled, NoTranscriptFound):
-                st.error("No transcript is available for this video (captions are disabled or unavailable). Paste a transcript manually for now.")
-            except CouldNotRetrieveTranscript:
-                st.error("YouTube blocked transcript retrieval or returned empty data. Try again later or paste the transcript manually.")
-            except Exception as e:
-                st.error(f"Unexpected error while fetching transcript: {e}")
+# ============ One-click handler ============
+if go:
+    st.session_state.logs = []  # reset
+    transcript_text: Optional[str] = None
+    timeline: Optional[List[Tuple[float, str]]] = None
+
+    with st.status("Working…", expanded=True) as status:
+        # 1) Get transcript: URL → YT → manual
+        if url:
+            vid = extract_youtube_id(url)
+            if vid:
+                log(f"Detected YouTube ID: {vid}")
+                try:
+                    transcript_text, timeline = fetch_youtube_transcript(vid)
+                    log(f"Fetched transcript: {len(transcript_text):,} characters.")
+                except (TranscriptsDisabled, NoTranscriptFound):
+                    log("No transcript available (captions disabled/unavailable).")
+                except CouldNotRetrieveTranscript as e:
+                    log(f"Transcript fetch returned empty/blocked: {e}")
+                except Exception as e:
+                    log(f"Unexpected YT fetch error: {type(e).__name__}: {e}")
+            else:
+                log("URL is not YouTube; auto-fetch not supported yet. Will use manual transcript if provided.")
         else:
-            st.info("Non-YouTube URLs aren’t auto-supported yet. Paste the transcript below and click Summarize.")
+            log("No URL provided; will use manual transcript if provided.")
 
-# ============ Summarize flow ============
-if summarize_btn:
-    # Decide transcript source
-    if not manual and not transcript_text:
-        if url and extract_youtube_id(url):
-            st.warning("Try 'Fetch Transcript' first, or paste the transcript manually.")
-        else:
-            st.warning("Please paste a transcript in the text area, then click Summarize.")
-    else:
-        effective_transcript = manual or transcript_text
+        if not transcript_text:
+            if manual.strip():
+                transcript_text = manual.strip()
+                log(f"Using manual transcript: {len(transcript_text):,} characters.")
+            else:
+                status.update(label="Need a transcript", state="error")
+                st.error("Could not obtain a transcript. Paste one in the text area and click again.")
+                st.stop()
+
+        # 2) Build persona + summarize
         persona = build_persona_prompt(
             style=tone,
             target_minutes=target_minutes,
             include_timestamps=include_ts,
             extra_focus=[s.strip() for s in extra_focus.split(",")] if extra_focus else []
         )
-        with st.spinner("Summarizing…"):
-            try:
-                summary_md = summarize_transcript(
-                    transcript=effective_transcript,
-                    persona_prompt=persona,
-                    model=model_choice,
-                    temperature=temperature
-                )
-                st.success("Summary ready!")
-                st.markdown(summary_md)
+        log("Persona prompt constructed.")
+        try:
+            summary_md = summarize_transcript(
+                transcript=transcript_text,
+                persona_prompt=persona,
+                model=model_choice,
+                temperature=temperature,
+                log=log
+            )
+            log("Final merged summary ready.")
+        except Exception as e:
+            status.update(label="Summarization failed", state="error")
+            st.error(f"Summarization failed: {type(e).__name__}: {e}")
+            st.stop()
 
-                # --- Audio summary (TTS) ---
-                with st.expander("🎧 Audio Summary"):
-                    tts_len_pref = st.slider(
-                        "Approx text length to narrate",
-                        1000, 12000, 6000, 500,
-                        help="Larger values create longer audio; capped for cloud stability."
-                    )
-                    voice = st.selectbox("Voice", ["alloy", "verse", "amber", "sage"], index=0)
-                    make_audio = st.button("Generate Audio (MP3)")
-                    if make_audio:
-                        with st.spinner("Generating audio summary…"):
-                            try:
-                                audio_bytes = tts_from_text(summary_md[:tts_len_pref], voice=voice)
-                                st.audio(audio_bytes, format="audio/mp3")
-                                st.download_button(
-                                    "Download audio summary (.mp3)",
-                                    data=audio_bytes,
-                                    file_name="roadscout_summary.mp3",
-                                    mime="audio/mpeg",
-                                )
-                            except Exception as e:
-                                st.error(f"TTS failed: {e}")
+        # 3) Render summary
+        st.success("Summary")
+        st.markdown(summary_md)
 
-                # Download text summary
-                md_bytes = io.BytesIO(summary_md.encode("utf-8"))
-                st.download_button(
-                    label="Download summary (.md)",
-                    data=md_bytes,
-                    file_name="roadscout_summary.md",
-                    mime="text/markdown"
-                )
-            except Exception as e:
-                st.error(f"Summarization failed: {e}")
+        # 4) Auto-generate audio summary
+        try:
+            log("Generating audio summary (TTS)…")
+            audio_bytes = tts_from_text(summary_md, voice=tts_voice, log=log)
+            st.audio(audio_bytes, format="audio/mp3")
+            st.download_button(
+                "Download audio summary (.mp3)",
+                data=audio_bytes,
+                file_name="roadscout_summary.mp3",
+                mime="audio/mpeg",
+            )
+            log("Audio ready.")
+            status.update(label="Done", state="complete")
+        except Exception as e:
+            log(f"TTS failed: {type(e).__name__}: {e}")
+            status.update(label="Summary ready (audio failed)", state="warning")
+            st.warning(f"TTS failed: {type(e).__name__}: {e}")
 
-# Footer note
-st.caption("Tip: For non-YouTube podcasts, paste the transcript manually for now. RSS/MP3 auto-transcribe is on the roadmap.")
+# Diagnostics
+with st.expander("Diagnostics (click to view logs)"):
+    if st.session_state.logs:
+        st.code("\n".join(st.session_state.logs))
+    else:
+        st.write("No logs yet. Paste a URL or transcript and click **Summarize & Play ▶️**.")
+
+# Footer
+st.caption("Notes: YouTube sometimes blocks transcripts (rate limits/region/captions off). For non-YouTube podcasts, paste transcript for now.")
