@@ -230,6 +230,48 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     return chunks
 
 
+# ==== Length control ====
+def estimate_words_from_minutes(minutes: int, wpm: int = 160) -> int:
+    """Target words for the final summary (aloud)."""
+    return max(200, int(minutes * wpm))
+
+def fit_summary_to_length(raw_md: str,
+                          persona_prompt: str,
+                          target_minutes: int,
+                          model: str,
+                          temperature: float,
+                          log=None) -> str:
+    """
+    Final 'fit' pass: compress/expand the merged summary to ~N words.
+    Uses a short instruction to avoid losing structure.
+    """
+    target_words = estimate_words_from_minutes(target_minutes)
+    if log: log(f"Fitting summary to ~{target_words} words (≈{target_minutes} min at ~160 wpm).")
+
+    # Keep structure but aim for target words. Use max_tokens as a soft cap.
+    # Rough conversion: 1 word ≈ 1.3 tokens → add slack.
+    soft_token_cap = int(target_words * 1.4) + 200
+
+    messages = [
+        {"role": "system", "content": persona_prompt},
+        {"role": "user", "content":
+            f"""Rewrite the following summary to approximately {target_words} words (±10%) while retaining the same section structure and key points.
+Keep it concise but substantive; do not remove mandatory headings.
+
+SUMMARY TO ADJUST:
+{raw_md}
+"""}
+    ]
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        # The SDK variant you’re on uses 'max_tokens' for chat completion output caps:
+        max_tokens=soft_token_cap
+    )
+    return resp.choices[0].message.content.strip()
+
+
 def summarize_transcript(transcript: str,
                          persona_prompt: str,
                          model: str = "gpt-4o-mini",
@@ -414,6 +456,15 @@ if go:
                 temperature=temperature,
                 log=log
             )
+            summary_md = fit_summary_to_length(
+                raw_md=summary_md,
+                persona_prompt=persona,
+                target_minutes=target_minutes,
+                model=model_choice,
+                temperature=temperature,
+                log=log
+            )
+
             log("Final merged summary ready.")
         except Exception as e:
             status.update(label="Summarization failed", state="error")
