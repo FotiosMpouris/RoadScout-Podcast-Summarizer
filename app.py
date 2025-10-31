@@ -186,25 +186,49 @@ def fetch_youtube_transcript_via_ytdlp(url: str) -> Tuple[str, List[Tuple[float,
         raise CouldNotRetrieveTranscript(f"Failed to download captions: {e}")
 
 def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
-    """Conservative chunking by characters; respects paragraph boundaries when possible."""
+    """
+    Split transcript into ~max_chars chunks.
+    Prefers paragraph breaks, but hard-splits long paragraphs so we never
+    end up with a single huge chunk.
+    """
     text = text.strip()
     if len(text) <= max_chars:
         return [text]
-    chunks = []
-    current = []
-    current_len = 0
-    for para in re.split(r"\n{2,}", text):
-        if current_len + len(para) + 2 <= max_chars:
-            current.append(para)
-            current_len += len(para) + 2
+
+    paras = re.split(r"\n{2,}", text)  # may be a single element for VTT-joined text
+    chunks: List[str] = []
+    buf = ""
+
+    for para in paras:
+        para = para.strip()
+        if not para:
+            continue
+
+        # If a single paragraph itself is too large, hard-split it.
+        if len(para) > max_chars:
+            # flush current buffer first
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            for i in range(0, len(para), max_chars):
+                piece = para[i:i + max_chars]
+                chunks.append(piece)
+            continue
+
+        # Normal packing into the buffer
+        if not buf:
+            buf = para
+        elif len(buf) + 2 + len(para) <= max_chars:
+            buf = f"{buf}\n\n{para}"
         else:
-            if current:
-                chunks.append("\n\n".join(current))
-            current = [para]
-            current_len = len(para)
-    if current:
-        chunks.append("\n\n".join(current))
+            chunks.append(buf)
+            buf = para
+
+    if buf:
+        chunks.append(buf)
+
     return chunks
+
 
 def summarize_transcript(transcript: str,
                          persona_prompt: str,
@@ -248,48 +272,47 @@ def tts_from_text(text: str,
                   log=None) -> bytes:
     """
     Create an MP3 from text using OpenAI TTS.
-    Uses streaming response when available; falls back to tts-1.
+    Uses streaming response; no 'format' kwarg (SDK variant).
+    Falls back to tts-1 if needed.
     """
     safe = text.strip()
     if len(safe) > max_chars:
         if log: log(f"TTS truncating from {len(safe):,} → {max_chars:,} chars for faster playback.")
         safe = safe[:max_chars] + "\n\n[...truncated for audio length...]"
 
-    # Try streaming first (most robust)
+    # Try streaming on gpt-4o-mini-tts
     try:
         if log: log(f"TTS (streaming) model={model}, voice={voice}")
         with client.audio.speech.with_streaming_response.create(
             model=model,
             voice=voice,
             input=safe,
-            format="mp3",
         ) as resp:
             return resp.read()  # bytes
     except Exception as e:
         if log: log(f"TTS streaming failed on {model}: {e}")
 
-    # Fallback to non-streaming create()
+    # Fallback to non-streaming create (still without 'format')
     try:
         if log: log(f"TTS (create) model={model}, voice={voice}")
         resp = client.audio.speech.create(
             model=model,
             voice=voice,
             input=safe,
-            format="mp3",
         )
         return resp.read()
     except Exception as e:
         if log: log(f"TTS create() failed on {model}: {e}")
 
-    # Final fallback: classic tts-1
+    # Final fallback to classic tts-1 (streaming)
     if log: log("TTS fallback to tts-1")
     with client.audio.speech.with_streaming_response.create(
         model="tts-1",
         voice=voice,
         input=safe,
-        format="mp3",
     ) as resp:
         return resp.read()
+
 
 
 def timeline_preview(tl: List[Tuple[float, str]]) -> str:
