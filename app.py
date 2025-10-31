@@ -12,7 +12,7 @@ except ImportError:
     st.error("Missing OpenAI SDK. Make sure 'openai' is in requirements.txt.")
     st.stop()
 
-# ---- YouTube transcript fetcher (no ffmpeg needed) ----
+# ---- YouTube transcript fetchers ----
 try:
     from youtube_transcript_api import (
         YouTubeTranscriptApi,
@@ -22,6 +22,15 @@ try:
     )
 except Exception:
     YouTubeTranscriptApi = None  # degrade gracefully
+
+import requests
+from requests.exceptions import RequestException
+
+# yt-dlp for fallback caption discovery
+try:
+    import yt_dlp
+except Exception:
+    yt_dlp = None  # degrade gracefully
 
 # ---- Prompts (from prompts.py) ----
 try:
@@ -57,53 +66,124 @@ def extract_youtube_id(url: str) -> Optional[str]:
     m = YOUTUBE_REGEX.search(url.strip())
     return m.group(1) if m else None
 
+# ---- Primary fetch using youtube-transcript-api ----
 def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = None) -> Tuple[str, List[Tuple[float, str]]]:
     """
-    Robust transcript fetcher:
-    - Try official captions first (preferred)
+    Robust transcript fetcher with youtube-transcript-api:
+    - Try official captions first
     - Then try auto-generated captions
-    - Return (joined_text, timeline [(start_seconds, text), ...])
+    Returns (joined_text, [(start_seconds, text), ...])
     """
     if YouTubeTranscriptApi is None:
         raise RuntimeError("youtube-transcript-api is not installed on this deployment.")
     languages = languages or ["en", "en-US", "en-GB"]
 
     try:
-        # 1) Try official captions directly
         data = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
     except Exception:
-        # 2) Fallback: search list & try generated transcripts explicitly
         transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
         chosen = None
-
-        # Prefer manually provided English
         for code in (languages + ["en"]):
             try:
                 chosen = transcripts.find_transcript([code])
                 break
             except Exception:
                 continue
-
-        # If still nothing, try auto-generated English
         if chosen is None:
             try:
                 chosen = transcripts.find_generated_transcript(["en"])
             except Exception:
                 pass
-
         if chosen is None:
             raise NoTranscriptFound("No official or auto-generated transcript available for this video.")
-
         data = chosen.fetch()
 
     timeline = [(item["start"], item["text"]) for item in data]
     joined = " ".join(seg for _, seg in timeline).strip()
     if not joined:
-        # Common when YT responds with empty/HTML content
         raise CouldNotRetrieveTranscript(
             "Transcript fetch returned empty content (YouTube may be blocking or captions are disabled)."
         )
     return joined, timeline
+
+# ---- Fallback fetch using yt-dlp + VTT parsing ----
+VTT_TS = re.compile(
+    r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2}\.\d{3})\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}"
+)
+
+def _parse_vtt(vtt_text: str) -> List[Tuple[float, str]]:
+    """
+    Very small WebVTT parser (enough for YouTube subs).
+    Returns [(start_seconds, text)]
+    """
+    lines = vtt_text.splitlines()
+    result: List[Tuple[float, str]] = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        m = VTT_TS.match(line)
+        if m:
+            # collect caption text until blank line
+            text_lines = []
+            i += 1
+            while i < len(lines) and lines[i].strip():
+                # strip simple VTT tags like <c> or <i>
+                text_lines.append(re.sub(r"<[^>]+>", "", lines[i]).strip())
+                i += 1
+            start = int(m.group("h")) * 3600 + int(m.group("m")) * 60 + float(m.group("s"))
+            text = " ".join(t for t in text_lines if t)
+            if text:
+                result.append((start, text))
+        else:
+            i += 1
+    return result
+
+def fetch_youtube_transcript_via_ytdlp(url: str) -> Tuple[str, List[Tuple[float, str]]]:
+    """
+    Uses yt-dlp to locate captions (official or auto) and downloads VTT to parse.
+    """
+    if yt_dlp is None:
+        raise RuntimeError("yt-dlp is not installed on this deployment.")
+    ydl_opts = {
+        "quiet": True,
+        "skip_download": True,
+        "writesubtitles": True,
+        "writeautomaticsub": True,
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    # Prefer official English subs, then auto English, then any English
+    def pick_track(container: dict, key: str) -> Optional[str]:
+        if not container or key not in container:
+            return None
+        # Try exact 'en' first; else any 'en-*'
+        if "en" in container[key]:
+            tracks = container[key]["en"]
+        else:
+            lang = next((k for k in container[key] if k.startswith("en")), None)
+            if not lang:
+                return None
+            tracks = container[key][lang]
+        # Prefer VTT
+        vtt = next((t for t in tracks if t.get("ext") == "vtt"), None)
+        if vtt:
+            return vtt.get("url")
+        return tracks[0].get("url") if tracks else None
+
+    vtt_url = (pick_track(info, "subtitles")
+               or pick_track(info, "automatic_captions"))
+    if not vtt_url:
+        raise NoTranscriptFound("No captions found via yt-dlp.")
+    try:
+        r = requests.get(vtt_url, timeout=15)
+        r.raise_for_status()
+        timeline = _parse_vtt(r.text)
+        joined = " ".join(seg for _, seg in timeline).strip()
+        if not joined:
+            raise CouldNotRetrieveTranscript("Empty VTT content.")
+        return joined, timeline
+    except RequestException as e:
+        raise CouldNotRetrieveTranscript(f"Failed to download captions: {e}")
 
 def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     """Conservative chunking by characters; respects paragraph boundaries when possible."""
@@ -131,12 +211,7 @@ def summarize_transcript(transcript: str,
                          model: str = "gpt-4o-mini",
                          temperature: float = 0.2,
                          log=None) -> str:
-    """
-    Sends chunked transcript to the model with a system+user flow:
-    - system: persona_prompt
-    - user: chunk i
-    Then merges with a final pass.
-    """
+    """Chunked summarize + merge."""
     chunks = chunk_text(transcript, max_chars=12000)
     if log: log(f"Transcript length: {len(transcript):,} chars → {len(chunks)} chunk(s).")
     intermediates: List[str] = []
@@ -211,7 +286,6 @@ with st.sidebar:
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
     tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)
 
-# Single input + single button = single action
 url = st.text_input("Paste podcast / episode URL (YouTube best for auto-transcript):").strip()
 manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=160)
 
@@ -230,20 +304,31 @@ if go:
     timeline: Optional[List[Tuple[float, str]]] = None
 
     with st.status("Working…", expanded=True) as status:
-        # 1) Get transcript: URL → YT → manual
+        # 1) Get transcript: URL → YT (primary) → yt-dlp fallback → manual
         if url:
             vid = extract_youtube_id(url)
             if vid:
                 log(f"Detected YouTube ID: {vid}")
+                # Primary: youtube-transcript-api
                 try:
                     transcript_text, timeline = fetch_youtube_transcript(vid)
-                    log(f"Fetched transcript: {len(transcript_text):,} characters.")
-                except (TranscriptsDisabled, NoTranscriptFound):
-                    log("No transcript available (captions disabled/unavailable).")
+                    log(f"[yt-transcript-api] OK – {len(transcript_text):,} chars.")
+                except (TranscriptsDisabled, NoTranscriptFound) as e:
+                    log(f"[yt-transcript-api] No transcript: {e}")
                 except CouldNotRetrieveTranscript as e:
-                    log(f"Transcript fetch returned empty/blocked: {e}")
+                    log(f"[yt-transcript-api] Empty/blocked: {e}")
                 except Exception as e:
-                    log(f"Unexpected YT fetch error: {type(e).__name__}: {e}")
+                    log(f"[yt-transcript-api] Unexpected: {type(e).__name__}: {e}")
+
+                # Fallback: yt-dlp captions
+                if not transcript_text:
+                    try:
+                        if yt_dlp is None:
+                            raise RuntimeError("yt-dlp not installed")
+                        transcript_text, timeline = fetch_youtube_transcript_via_ytdlp(url)
+                        log(f"[yt-dlp] captions OK – {len(transcript_text):,} chars.")
+                    except Exception as e:
+                        log(f"[yt-dlp] fallback failed: {type(e).__name__}: {e}")
             else:
                 log("URL is not YouTube; auto-fetch not supported yet. Will use manual transcript if provided.")
         else:
@@ -252,7 +337,7 @@ if go:
         if not transcript_text:
             if manual.strip():
                 transcript_text = manual.strip()
-                log(f"Using manual transcript: {len(transcript_text):,} characters.")
+                log(f"Using manual transcript: {len(transcript_text):,} chars.")
             else:
                 status.update(label="Need a transcript", state="error")
                 st.error("Could not obtain a transcript. Paste one in the text area and click again.")
