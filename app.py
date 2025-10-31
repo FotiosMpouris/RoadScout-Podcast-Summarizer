@@ -246,19 +246,51 @@ def tts_from_text(text: str,
                   voice: str = "alloy",
                   max_chars: int = 8000,
                   log=None) -> bytes:
-    """Create an MP3 from text using OpenAI TTS. Truncates to keep it snappy on Cloud."""
+    """
+    Create an MP3 from text using OpenAI TTS.
+    Uses streaming response when available; falls back to tts-1.
+    """
     safe = text.strip()
     if len(safe) > max_chars:
         if log: log(f"TTS truncating from {len(safe):,} → {max_chars:,} chars for faster playback.")
         safe = safe[:max_chars] + "\n\n[...truncated for audio length...]"
+
+    # Try streaming first (most robust)
     try:
-        if log: log(f"TTS model={model}, voice={voice}")
-        resp = client.audio.speech.create(model=model, voice=voice, input=safe, format="mp3")
+        if log: log(f"TTS (streaming) model={model}, voice={voice}")
+        with client.audio.speech.with_streaming_response.create(
+            model=model,
+            voice=voice,
+            input=safe,
+            format="mp3",
+        ) as resp:
+            return resp.read()  # bytes
+    except Exception as e:
+        if log: log(f"TTS streaming failed on {model}: {e}")
+
+    # Fallback to non-streaming create()
+    try:
+        if log: log(f"TTS (create) model={model}, voice={voice}")
+        resp = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=safe,
+            format="mp3",
+        )
         return resp.read()
     except Exception as e:
-        if log: log(f"TTS fallback (tts-1): {e}")
-        resp = client.audio.speech.create(model="tts-1", voice=voice, input=safe, format="mp3")
+        if log: log(f"TTS create() failed on {model}: {e}")
+
+    # Final fallback: classic tts-1
+    if log: log("TTS fallback to tts-1")
+    with client.audio.speech.with_streaming_response.create(
+        model="tts-1",
+        voice=voice,
+        input=safe,
+        format="mp3",
+    ) as resp:
         return resp.read()
+
 
 def timeline_preview(tl: List[Tuple[float, str]]) -> str:
     lines = []
@@ -382,10 +414,12 @@ if go:
             )
             log("Audio ready.")
             status.update(label="Done", state="complete")
+        
         except Exception as e:
             log(f"TTS failed: {type(e).__name__}: {e}")
-            status.update(label="Summary ready (audio failed)", state="warning")
+            status.update(label="Summary ready (audio failed)", state="complete")
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
+
 
 # Diagnostics
 with st.expander("Diagnostics (click to view logs)"):
