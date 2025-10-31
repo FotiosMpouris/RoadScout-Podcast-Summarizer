@@ -5,6 +5,8 @@ from typing import List, Optional, Tuple
 
 import streamlit as st
 
+st.caption("🔐 Secrets OK") if OPENAI_API_KEY else st.error("No OPENAI_API_KEY detected")
+
 # ---- OpenAI client (official SDK) ----
 try:
     from openai import OpenAI
