@@ -12,8 +12,7 @@ except ImportError:
     st.error("Missing OpenAI SDK. Make sure 'openai' is in requirements.txt.")
     st.stop()
 
-# ---- Optional: YouTube transcript fetcher ----
-# Lightweight and Streamlit-Cloud friendly (no ffmpeg)
+# ---- YouTube transcript fetcher (no ffmpeg needed) ----
 try:
     from youtube_transcript_api import (
         YouTubeTranscriptApi,
@@ -22,8 +21,10 @@ try:
         CouldNotRetrieveTranscript,
     )
 except Exception:
-    # We'll degrade gracefully if this isn't available
-    YouTubeTranscriptApi = None
+    YouTubeTranscriptApi = None  # degrade gracefully
+
+# (Optional) yt-dlp installed via requirements for future RSS/MP3 support
+# import yt_dlp  # not used yet
 
 # ---- Prompts (from prompts.py) ----
 try:
@@ -36,13 +37,17 @@ except Exception as e:
 # App Config
 # =========================
 st.set_page_config(page_title="RoadScout: Podcast Summarizer", page_icon="🎧", layout="wide")
+st.title("🎧 RoadScout: Podcast Summarizer")
+st.caption("Paste a podcast or YouTube URL, fetch transcript (when available), get a persona-driven summary, and play an audio summary.")
 
-# Expect OPENAI_API_KEY in Streamlit secrets
+# =========================
+# Secrets / API Key
+# =========================
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    st.error("OpenAI API key not found. Add `OPENAI_API_KEY` to Streamlit Secrets.")
-    st.stop()
 st.caption("🔐 Secrets OK") if OPENAI_API_KEY else st.error("No OPENAI_API_KEY detected")
+if not OPENAI_API_KEY:
+    st.stop()
+
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 # =========================
@@ -58,34 +63,51 @@ def extract_youtube_id(url: str) -> Optional[str]:
 
 def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = None) -> Tuple[str, List[Tuple[float, str]]]:
     """
-    Returns (joined_text, [(start_seconds, text), ...])
-    If no transcript, raises a handled exception.
+    Robust transcript fetcher:
+    - Try official captions first (preferred)
+    - Then try auto-generated captions
+    - Return (joined_text, timeline [(start_seconds, text), ...])
     """
     if YouTubeTranscriptApi is None:
         raise RuntimeError("youtube-transcript-api is not installed.")
-    languages = languages or ["en", "en-US", "en-GB", "auto"]
+    languages = languages or ["en", "en-US", "en-GB"]
+
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-        # Prefer English; fall back to generated
-        candidates = []
-        for code in languages:
+        # 1) Try official captions directly
+        data = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
+    except Exception:
+        # 2) Fallback: search list & try generated transcripts explicitly
+        transcripts = YouTubeTranscriptApi.list_transcripts(video_id)
+        chosen = None
+
+        # Prefer manually provided English
+        for code in (languages + ["en"]):
             try:
-                candidates.append(transcript_list.find_transcript([code]))
+                chosen = transcripts.find_transcript([code])
+                break
             except Exception:
                 continue
-        if not candidates:
-            # Fallback: the first transcript available
-            candidates = [next(iter(transcript_list), None)]
-        chosen = next((c for c in candidates if c is not None), None)
-        if not chosen:
-            raise NoTranscriptFound("No transcript candidate found.")
+
+        # If still nothing, try auto-generated English
+        if chosen is None:
+            try:
+                chosen = transcripts.find_generated_transcript(["en"])
+            except Exception:
+                pass
+
+        if chosen is None:
+            raise NoTranscriptFound("No official or auto-generated transcript available for this video.")
+
         data = chosen.fetch()
-        # Build timeline text
-        timeline = [(item["start"], item["text"]) for item in data]
-        joined = " ".join(seg for _, seg in timeline)
-        return joined, timeline
-    except (TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript) as e:
-        raise e
+
+    timeline = [(item["start"], item["text"]) for item in data]
+    joined = " ".join(seg for _, seg in timeline).strip()
+    if not joined:
+        # Common when YT responds with empty/HTML content
+        raise CouldNotRetrieveTranscript(
+            "Transcript fetch returned empty content (YouTube may be blocking or captions are disabled)."
+        )
+    return joined, timeline
 
 def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     """Conservative chunking by characters; respects paragraph boundaries when possible."""
@@ -146,23 +168,51 @@ def summarize_transcript(transcript: str,
     )
     return final_resp.choices[0].message.content.strip()
 
-def timeline_with_timestamps(timeline: List[Tuple[float, str]]) -> str:
+def timeline_with_timestamps(tl: List[Tuple[float, str]]) -> str:
     """Utility for showing a simple preview of fetched transcript with timestamps."""
     preview_lines = []
-    for start, text in timeline[:40]:  # limit preview
+    for start, text in tl[:40]:  # limit preview
         mm = int(start // 60)
         ss = int(start % 60)
         preview_lines.append(f"[{mm:02d}:{ss:02d}] {text}")
-    if len(timeline) > 40:
+    if len(tl) > 40:
         preview_lines.append("... (truncated preview)")
     return "\n".join(preview_lines)
+
+def tts_from_text(text: str,
+                  model: str = "gpt-4o-mini-tts",
+                  voice: str = "alloy",
+                  max_chars: int = 8000) -> bytes:
+    """
+    Create an MP3 from text using OpenAI TTS.
+    Truncates input defensively to avoid very long TTS jobs on Cloud runtimes.
+    """
+    safe = text.strip()
+    if len(safe) > max_chars:
+        safe = safe[:max_chars] + "\n\n[...truncated for audio length...]"
+
+    try:
+        # Preferred new TTS
+        resp = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=safe,
+            format="mp3",
+        )
+        return resp.read()  # bytes
+    except Exception:
+        # Fallback to tts-1 if mini-tts isn’t available
+        resp = client.audio.speech.create(
+            model="tts-1",
+            voice=voice,
+            input=safe,
+            format="mp3",
+        )
+        return resp.read()
 
 # =========================
 # UI
 # =========================
-st.title("🎧 RoadScout: Podcast Summarizer")
-st.caption("Paste a podcast or YouTube URL, fetch transcript (when available), and get a persona-driven summary.")
-
 with st.sidebar:
     st.subheader("Summary Settings")
     tone = st.selectbox(
@@ -181,7 +231,6 @@ st.write("— or —")
 manual = st.text_area("Paste transcript manually (if no transcript can be fetched):", height=200)
 
 colA, colB = st.columns([1, 1])
-
 with colA:
     fetch_btn = st.button("Fetch Transcript (from URL)")
 with colB:
@@ -190,7 +239,7 @@ with colB:
 transcript_text: Optional[str] = None
 timeline: Optional[List[Tuple[float, str]]] = None
 
-# Fetch transcript flow
+# ============ Fetch transcript flow ============
 if fetch_btn:
     if not url:
         st.warning("Please paste a URL first.")
@@ -205,12 +254,16 @@ if fetch_btn:
                     st.code(timeline_with_timestamps(timeline))
                 with st.expander("Raw Transcript (joined)"):
                     st.write(transcript_text[:4000] + ("..." if len(transcript_text) > 4000 else ""))
+            except (TranscriptsDisabled, NoTranscriptFound):
+                st.error("No transcript is available for this video (captions are disabled or unavailable). Paste a transcript manually for now.")
+            except CouldNotRetrieveTranscript:
+                st.error("YouTube blocked transcript retrieval or returned empty data. Try again later or paste the transcript manually.")
             except Exception as e:
-                st.error(f"Could not fetch YouTube transcript: {e}")
+                st.error(f"Unexpected error while fetching transcript: {e}")
         else:
-            st.info("Non-YouTube URLs are not auto-supported yet. Paste the transcript below and click Summarize.")
+            st.info("Non-YouTube URLs aren’t auto-supported yet. Paste the transcript below and click Summarize.")
 
-# Summarize flow
+# ============ Summarize flow ============
 if summarize_btn:
     # Decide transcript source
     if not manual and not transcript_text:
@@ -237,7 +290,30 @@ if summarize_btn:
                 st.success("Summary ready!")
                 st.markdown(summary_md)
 
-                # Download button
+                # --- Audio summary (TTS) ---
+                with st.expander("🎧 Audio Summary"):
+                    tts_len_pref = st.slider(
+                        "Approx text length to narrate",
+                        1000, 12000, 6000, 500,
+                        help="Larger values create longer audio; capped for cloud stability."
+                    )
+                    voice = st.selectbox("Voice", ["alloy", "verse", "amber", "sage"], index=0)
+                    make_audio = st.button("Generate Audio (MP3)")
+                    if make_audio:
+                        with st.spinner("Generating audio summary…"):
+                            try:
+                                audio_bytes = tts_from_text(summary_md[:tts_len_pref], voice=voice)
+                                st.audio(audio_bytes, format="audio/mp3")
+                                st.download_button(
+                                    "Download audio summary (.mp3)",
+                                    data=audio_bytes,
+                                    file_name="roadscout_summary.mp3",
+                                    mime="audio/mpeg",
+                                )
+                            except Exception as e:
+                                st.error(f"TTS failed: {e}")
+
+                # Download text summary
                 md_bytes = io.BytesIO(summary_md.encode("utf-8"))
                 st.download_button(
                     label="Download summary (.md)",
@@ -249,4 +325,4 @@ if summarize_btn:
                 st.error(f"Summarization failed: {e}")
 
 # Footer note
-st.caption("Tip: For non-YouTube podcasts, paste the transcript manually for now. Auto-fetch for RSS/audio is on the roadmap.")
+st.caption("Tip: For non-YouTube podcasts, paste the transcript manually for now. RSS/MP3 auto-transcribe is on the roadmap.")
