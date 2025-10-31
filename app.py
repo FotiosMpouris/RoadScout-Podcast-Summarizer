@@ -15,10 +15,22 @@ except ImportError:
 # ---- Optional: YouTube transcript fetcher ----
 # Lightweight and Streamlit-Cloud friendly (no ffmpeg)
 try:
-    from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound, CouldNotRetrieveTranscript
+    from youtube_transcript_api import (
+        YouTubeTranscriptApi,
+        TranscriptsDisabled,
+        NoTranscriptFound,
+        CouldNotRetrieveTranscript,
+    )
 except Exception:
     # We'll degrade gracefully if this isn't available
     YouTubeTranscriptApi = None
+
+# ---- Prompts (from prompts.py) ----
+try:
+    from prompts import build_persona_prompt
+except Exception as e:
+    st.error(f"Could not import prompts.py: {e}")
+    st.stop()
 
 # =========================
 # App Config
@@ -95,55 +107,6 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     if current:
         chunks.append("\n\n".join(current))
     return chunks
-
-def build_persona_prompt(
-    style: str,
-    target_minutes: int,
-    include_timestamps: bool,
-    extra_focus: List[str]
-) -> str:
-    """
-    style: tone/voice guidance
-    target_minutes: roughly how long a read you'd want (guides density)
-    include_timestamps: whether to attach timestamps when available
-    extra_focus: user-specified focus tags
-    """
-    focus_bullets = "".join(f"- {f}\n" for f in extra_focus if f.strip())
-    ts_note = (
-        "When possible, include timestamps like [mm:ss] for key moments." if include_timestamps
-        else "Skip timestamps in the output."
-    )
-    return f"""
-You are a hybrid **Financial Analyst + Technology Analyst + Scientific Analyst** summarization expert.
-Your task is to produce a **thorough but digestible** summary of a podcast transcript.
-
-**Priorities**
-- Identify and explain: (1) AI developments/claims/impacts, (2) market/finance angles (business models, incentives, risks, macro links), (3) scientific/technical claims and their implications.
-- NO external research: analyze only what’s in the transcript; if a claim seems bold, flag it briefly as “claim to verify”.
-- Preserve nuance, disagreements, uncertainties, and context.
-
-**Structure (use clear markdown headings & bullets)**
-1) TL;DR (5–10 bullets)
-2) Episode Outline (chronological; short paragraphs)
-3) Analyst Lenses
-   - Financial: revenue models, costs, incentives, market impacts
-   - Technology: architectures, limitations, safety, compute/data needs
-   - Science: hypotheses, evidence cited, caveats
-4) Notable Quotes & Concepts {("(with timestamps)" if include_timestamps else "")}
-5) Claims to Verify (bulleted)
-6) Actionable Takeaways (for a busy reader)
-
-**Constraints & Style**
-- Target a reading length that would take about **{target_minutes} minutes** to read aloud.
-- {ts_note}
-- Write in a **{style}** tone.
-- Be concise but **substantive**—no fluff, no filler.
-
-If specific “focus areas” were provided by the user, briefly weave them in:
-{focus_bullets if focus_bullets else "(No additional focus areas provided.)"}
-
-Now wait for the transcript chunks. For each chunk, produce a compact intermediate summary, then at the end merge all chunk summaries into a single cohesive final report.
-"""
 
 def summarize_transcript(transcript: str,
                          persona_prompt: str,
