@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from audio_utils import tts_to_single_mp3
+
 import streamlit as st
 
 # ---- OpenAI client (official SDK) ----
@@ -47,6 +49,9 @@ except Exception as e:
 # App Config + '70s Theme
 # =========================
 st.set_page_config(page_title="RoadScout: Podcast Summarizer", page_icon="🎧", layout="wide")
+# --- session logs (safe to add even if already present) ---
+st.session_state.setdefault("logs", [])
+
 st.markdown(
     """
     <style>
@@ -381,82 +386,6 @@ SUMMARY TO ADJUST:
     return resp.choices[0].message.content.strip()
 
 # ---------- FULL-LENGTH AUDIO (multipart + parallel) ----------
-def split_for_tts(text: str, part_chars: int = 5500) -> List[str]:
-    text = text.strip()
-    if len(text) <= part_chars:
-        return [text]
-    parts: List[str] = []
-    buf = ""
-    for para in re.split(r"\n{2,}", text):
-        para = para.strip()
-        if not para:
-            continue
-        if len(para) > part_chars:
-            if buf:
-                parts.append(buf); buf = ""
-            for i in range(0, len(para), part_chars):
-                parts.append(para[i:i+part_chars])
-            continue
-        if not buf:
-            buf = para
-        elif len(buf) + 2 + len(para) <= part_chars:
-            buf = f"{buf}\n\n{para}"
-        else:
-            parts.append(buf); buf = para
-    if buf:
-        parts.append(buf)
-    return parts
-
-def _tts_bytes(text: str, voice: str) -> bytes:
-    """
-    Note: NO logging here (workers run in threads without Streamlit session context).
-    """
-    # Try streaming first
-    try:
-        with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice=voice,
-            input=text,
-        ) as resp:
-            return resp.read()
-    except Exception:
-        pass
-    # Then non-streaming
-    try:
-        resp = client.audio.speech.create(
-            model="gpt-4o-mini-tts",
-            voice=voice,
-            input=text,
-        )
-        return resp.read()
-    except Exception:
-        pass
-    # Final fallback
-    with client.audio.speech.with_streaming_response.create(
-        model="tts-1",
-        voice=voice,
-        input=text,
-    ) as resp:
-        return resp.read()
-
-def tts_multipart_parallel(summary_md: str, voice: str, max_workers: int = 3) -> List[Tuple[int, bytes]]:
-    parts_text = split_for_tts(summary_md, part_chars=5500)
-    # Main thread log only
-    st.session_state.logs.append(f"TTS will generate {len(parts_text)} part(s) in parallel ({max_workers} workers).")
-    results: List[Tuple[int, bytes]] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_tts_bytes, pt, voice): idx for idx, pt in enumerate(parts_text, 1)}
-        for fut in as_completed(futures):
-            idx = futures[fut]
-            try:
-                audio = fut.result()
-                results.append((idx, audio))
-            except Exception as e:
-                st.session_state.logs.append(f"TTS part {idx} failed: {type(e).__name__}: {e}")
-    results.sort(key=lambda x: x[0])
-    return results
-
-
 # =========================
 # Sidebar – controls
 # =========================
@@ -566,39 +495,43 @@ if go:
         md_bytes = io.BytesIO(summary_md.encode("utf-8"))
         st.download_button("Download summary (.md)", md_bytes, file_name=f"{base}_{ts}.md", mime="text/markdown")
         st.markdown('</div>', unsafe_allow_html=True)
-
-        # 4) Audio summary (parallel parts, with thread-safe logging)
+        # --- Single-file TTS (one MP3) ---
         try:
-            log("Generating audio summary (parallel parts)…")
-            parts = tts_multipart_parallel(summary_md, voice=tts_voice, max_workers=3)
+            st.session_state.logs.append("Generating single-file audio (stitched in-memory)…")
 
-            for i, audio_bytes in parts:
-                st.audio(audio_bytes, format="audio/mp3")
-                st.download_button(
-                    f"Download Part {i} (.mp3)",
-                    data=audio_bytes,
-                    file_name=f"{base}_{ts}_part{i}.mp3",
-                    mime="audio/mpeg",
-                    key=f"dl_part_{i}"
-                )
+            mp3_bytes = tts_to_single_mp3(
+                client=client,
+                text=summary_md,
+                voice=tts_voice,
+                max_workers=3
+            )
 
-            zip_mem = io.BytesIO()
-            with zipfile.ZipFile(zip_mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for i, audio_bytes in parts:
-                    zf.writestr(f"{base}_{ts}_part{i}.mp3", audio_bytes)
-            zip_mem.seek(0)
-            st.download_button("Download all parts (.zip)", zip_mem.read(), file_name=f"{base}_{ts}.zip", mime="application/zip")
+            # Inline audio player
+            st.audio(mp3_bytes, format="audio/mp3")
+
+            # Recognizable filename
+            st.download_button(
+                "Download full audio (.mp3)",
+                data=mp3_bytes,
+                file_name=f"{base}_{ts}.mp3",
+                mime="audio/mpeg",
+                use_container_width=True,
+            )
 
             status.update(label="Done", state="complete")
+
             if play_ding:
                 st.markdown("<script>rs_playDing()</script>", unsafe_allow_html=True)
-            log("Audio parts ready.")
+
+            st.session_state.logs.append("Single MP3 ready.")
+
         except Exception as e:
             status.update(label="Summary ready (audio failed)", state="complete")
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
+            st.session_state.logs.append(f"TTS failed: {type(e).__name__}: {e}")
             if play_ding:
                 st.markdown("<script>rs_playDing()</script>", unsafe_allow_html=True)
-            log(f"TTS failed: {type(e).__name__}: {e}")
+       
 
 # Diagnostics
 with st.expander("Diagnostics (click to view logs)"):
