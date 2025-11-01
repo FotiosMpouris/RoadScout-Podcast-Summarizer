@@ -128,13 +128,62 @@ st.markdown(
     .stButton>button {font-size: 1.05rem; padding: 0.6rem 1rem; border-radius: 14px; border:2px solid var(--rs-deep); box-shadow: 4px 4px 0 var(--rs-deep);}
     .stTextInput>div>div>input, .stTextArea textarea {font-size: 1rem;}
     .element-container:has(audio){ background:#fff; border-radius:12px; padding:.3rem .5rem; border:1px solid #ddd;}
+
+    /* Groovy field wrappers */
+    .rs-field{
+      margin: .5rem 0 .25rem 0;
+      padding: .2rem .2rem 0 .2rem;
+    }
+    .rs-label{
+      display:inline-flex;
+      gap:.5rem;
+      align-items:center;
+      font-family:'Kalam', cursive;
+      font-weight:700;
+      color: var(--rs-deep);
+      background: linear-gradient(90deg, #fff9, #fff0);
+      padding:.25rem .6rem;
+      border:2px solid var(--rs-deep);
+      border-radius: 12px;
+      box-shadow: 4px 4px 0 var(--rs-deep);
+    }
+    .rs-hint{
+      margin-left:.4rem;
+      font-weight:400;
+      font-size:.9rem;
+      color:#2d3a43;
+      opacity:.85;
+    }
+
+    /* Make input fields stand out */
+    div[data-baseweb="input"] input,
+    textarea{
+      background:#ffffffee !important;
+      border:2px solid var(--rs-deep) !important;
+      box-shadow: 4px 4px 0 var(--rs-deep) !important;
+      border-radius: 12px !important;
+      padding:.8rem 1rem !important;
+      font-size:1rem !important;
+    }
+
+    /* Tighten the input container so it visually groups with the label */
+    .stTextInput, .stTextArea{
+      margin-top:.35rem;
+      margin-bottom: .9rem;
+    }
+
+    /* Mobile comfort: make touch targets a bit taller */
+    @media (max-width: 768px){
+      textarea{ min-height: 160px; }
+    }
+
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 st.markdown("<h1>🎧 RoadScout</h1>", unsafe_allow_html=True)
-st.caption("Paste a podcast/YouTube URL (or transcript), tap once, and get a persona-driven text + audio summary.")
+st.caption("Drop a podcast link below, hit go, and RoadScout spins a slick text + audio summary.")
 
 # Inline JS for completion ding
 st.markdown(
@@ -407,10 +456,34 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Main inputs
-st.markdown('<div class="rs-card"><span class="rs-title">🔗 Input</span><span class="rs-chip yellow">Paste your URL below</span><div class="rs-section"></div>', unsafe_allow_html=True)
-url = st.text_input("Paste podcast / episode URL (YouTube works best for auto-transcript):").strip()
-manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=130)
-st.markdown('</div>', unsafe_allow_html=True)
+# Main inputs (clean + punchy)
+st.markdown("""
+<div class="rs-field">
+  <div class="rs-label">🎬 Paste a podcast / episode URL
+    <span class="rs-hint">(YouTube works best for auto-transcript)</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+url = st.text_input(
+    "Paste podcast / episode URL (YouTube works best for auto-transcript):",
+    label_visibility="collapsed",
+    placeholder="https://www.youtube.com/watch?v=XXXXXXXXXXX"
+).strip()
+
+st.markdown("""
+<div class="rs-field">
+  <div class="rs-label">📝 Or paste a transcript manually
+    <span class="rs-hint">(auto-used if URL fails)</span>
+  </div>
+</div>
+""", unsafe_allow_html=True)
+manual = st.text_area(
+    "Or paste transcript manually (auto-used if URL fails):",
+    label_visibility="collapsed",
+    height=140,
+    placeholder="Paste the full transcript here…"
+)
+
 
 go = st.button("Summarize & Play ▶️", use_container_width=True)
 
