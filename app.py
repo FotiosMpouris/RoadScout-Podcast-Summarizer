@@ -59,6 +59,8 @@ st.markdown(
       --rs-teal:#06D6A0;
       --rs-deep:#073B4C;
       --rs-cream:#FFF7E6;
+      --rs-side:#1f2a33;
+      --rs-side-accent:#ffb703;
     }
 
     /* Groovy gradient background */
@@ -67,6 +69,29 @@ st.markdown(
                   radial-gradient(circle at 85% 30%, var(--rs-orange), transparent 45%),
                   radial-gradient(circle at 30% 80%, var(--rs-teal), transparent 45%),
                   linear-gradient(120deg, #fff, var(--rs-cream));
+    }
+
+    /* Sidebar dark '70s vibe */
+    section[data-testid="stSidebar"] {
+      background: linear-gradient(180deg, var(--rs-side) 0%, #132028 100%);
+      color: #f3f3f3;
+      border-right: 4px solid #0b1419;
+    }
+    section[data-testid="stSidebar"] h2, section[data-testid="stSidebar"] h3,
+    section[data-testid="stSidebar"] label, section[data-testid="stSidebar"] p {
+      color: #f3f3f3 !important;
+      font-family: 'Kalam', cursive;
+    }
+    section[data-testid="stSidebar"] .stSlider > div > div > div[role="slider"] {
+      background: var(--rs-side-accent) !important;
+      border: 2px solid black;
+    }
+    section[data-testid="stSidebar"] .stSlider > div > div > div[role="slider"] + div {
+      background: #ffd16655 !important;
+    }
+    section[data-testid="stSidebar"] .stSelectbox, section[data-testid="stSidebar"] .stTextInput,
+    section[data-testid="stSidebar"] .stTextArea {
+      filter: drop-shadow(0 2px 0 rgba(0,0,0,.35));
     }
 
     h1, .stMarkdown h1 { font-family: 'Shrikhand', cursive; color: var(--rs-deep); letter-spacing: 1px; }
@@ -135,6 +160,12 @@ if not OPENAI_API_KEY:
     st.error("No OPENAI_API_KEY detected. Add it in Streamlit → Settings → Secrets.")
     st.stop()
 client = OpenAI(api_key=OPENAI_API_KEY)
+
+# Initialize logs once on the main thread
+if "logs" not in st.session_state:
+    st.session_state.logs = []
+def log(msg: str):
+    st.session_state.logs.append(msg)
 
 
 # =========================
@@ -376,28 +407,31 @@ def split_for_tts(text: str, part_chars: int = 5500) -> List[str]:
         parts.append(buf)
     return parts
 
-def _tts_bytes(text: str, voice: str, log=None) -> bytes:
+def _tts_bytes(text: str, voice: str) -> bytes:
+    """
+    Note: NO logging here (workers run in threads without Streamlit session context).
+    """
+    # Try streaming first
     try:
-        if log: log("TTS streaming (primary)")
         with client.audio.speech.with_streaming_response.create(
             model="gpt-4o-mini-tts",
             voice=voice,
             input=text,
         ) as resp:
             return resp.read()
-    except Exception as e:
-        if log: log(f"TTS streaming failed: {e}")
+    except Exception:
+        pass
+    # Then non-streaming
     try:
-        if log: log("TTS create() (secondary)")
         resp = client.audio.speech.create(
             model="gpt-4o-mini-tts",
             voice=voice,
             input=text,
         )
         return resp.read()
-    except Exception as e:
-        if log: log(f"TTS create() failed: {e}")
-    if log: log("TTS fallback to tts-1")
+    except Exception:
+        pass
+    # Final fallback
     with client.audio.speech.with_streaming_response.create(
         model="tts-1",
         voice=voice,
@@ -405,16 +439,20 @@ def _tts_bytes(text: str, voice: str, log=None) -> bytes:
     ) as resp:
         return resp.read()
 
-def tts_multipart_parallel(summary_md: str, voice: str, max_workers: int = 3, log=None) -> List[Tuple[int, bytes]]:
+def tts_multipart_parallel(summary_md: str, voice: str, max_workers: int = 3) -> List[Tuple[int, bytes]]:
     parts_text = split_for_tts(summary_md, part_chars=5500)
-    if log: log(f"TTS will generate {len(parts_text)} part(s) in parallel ({max_workers} workers).")
+    # Main thread log only
+    st.session_state.logs.append(f"TTS will generate {len(parts_text)} part(s) in parallel ({max_workers} workers).")
     results: List[Tuple[int, bytes]] = []
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(_tts_bytes, pt, voice, log): idx for idx, pt in enumerate(parts_text, 1)}
+        futures = {ex.submit(_tts_bytes, pt, voice): idx for idx, pt in enumerate(parts_text, 1)}
         for fut in as_completed(futures):
             idx = futures[fut]
-            audio = fut.result()
-            results.append((idx, audio))
+            try:
+                audio = fut.result()
+                results.append((idx, audio))
+            except Exception as e:
+                st.session_state.logs.append(f"TTS part {idx} failed: {type(e).__name__}: {e}")
     results.sort(key=lambda x: x[0])
     return results
 
@@ -423,13 +461,13 @@ def tts_multipart_parallel(summary_md: str, voice: str, max_workers: int = 3, lo
 # Sidebar – controls
 # =========================
 with st.sidebar:
-    st.markdown('<div class="rs-card"><span class="rs-title">🎛️ Controls <span class="rs-chip teal">New</span></span>', unsafe_allow_html=True)
+    st.markdown('<div class="rs-card" style="background:#263542cc;border-color:#0b1419;box-shadow:6px 6px 0 #0b1419;"><span class="rs-title" style="color:#fff;">🎛️ Controls <span class="rs-chip teal">New</span></span>', unsafe_allow_html=True)
     tone = st.selectbox(
         "Tone",
         ["clear and professional", "friendly and concise", "analytical and direct", "executive brief"],
         index=2
     )
-    target_minutes = st.slider("Target read length (minutes)", 5, 25, 12, 1)
+    target_minutes = st.slider("Target read length (minutes)", 5, 25, 25, 1)
     include_ts = st.checkbox("Include timestamps when possible", value=True)
     extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
     model_choice = st.selectbox("Merge/Fit Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
@@ -440,22 +478,16 @@ with st.sidebar:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Main inputs
-st.markdown('<div class="rs-card"><span class="rs-title">🔗 Input</span><span class="rs-chip yellow">One-click</span><div class="rs-section"></div>', unsafe_allow_html=True)
+st.markdown('<div class="rs-card"><span class="rs-title">🔗 Input</span><span class="rs-chip yellow">Paste your URL below</span><div class="rs-section"></div>', unsafe_allow_html=True)
 url = st.text_input("Paste podcast / episode URL (YouTube works best for auto-transcript):").strip()
 manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=130)
 st.markdown('</div>', unsafe_allow_html=True)
 
 go = st.button("Summarize & Play ▶️", use_container_width=True)
 
-# Logger
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-def log(msg: str):
-    st.session_state.logs.append(msg)
-
 # ============ One-click handler ============
 if go:
-    st.session_state.logs = []
+    st.session_state.logs = []  # reset logs each run
     transcript_text: Optional[str] = None
     timeline: Optional[List[Tuple[float, str]]] = None
     episode_title: Optional[str] = None
@@ -493,7 +525,7 @@ if go:
                 st.error("Could not obtain a transcript. Paste one and click again.")
                 st.stop()
 
-        # 2) Persona + summarize (speed mode uses mini for chunks)
+        # 2) Persona + summarize
         persona = build_persona_prompt(
             style=tone,
             target_minutes=target_minutes,
@@ -535,10 +567,10 @@ if go:
         st.download_button("Download summary (.md)", md_bytes, file_name=f"{base}_{ts}.md", mime="text/markdown")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        # 4) Audio summary (parallel parts)
+        # 4) Audio summary (parallel parts, with thread-safe logging)
         try:
             log("Generating audio summary (parallel parts)…")
-            parts = tts_multipart_parallel(summary_md, voice=tts_voice, max_workers=3, log=log)
+            parts = tts_multipart_parallel(summary_md, voice=tts_voice, max_workers=3)
 
             for i, audio_bytes in parts:
                 st.audio(audio_bytes, format="audio/mp3")
