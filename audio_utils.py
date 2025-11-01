@@ -1,136 +1,145 @@
 # audio_utils.py
-import io
+import os
 import re
-from typing import List, Tuple, Optional
+import tempfile
+import subprocess
+from typing import List
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from pydub import AudioSegment
-
-# OpenAI client is created in app.py and passed in
-# We stay tool-agnostic here.
-
-
-# ---------- light text normalization to improve pronunciation ----------
-_ABBR_MAP = [
-    (r"\bF(arenh(e|)ight)\b", "Fahrenheit"),
-    (r"°\s*F\b", " degrees Fahrenheit"),
-    (r"\b°F\b", " degrees Fahrenheit"),
-    (r"\bCelsius\b", " Celsius"),
-    (r"°\s*C\b", " degrees Celsius"),
-    (r"\b°C\b", " degrees Celsius"),
-    (r"\bHz\b", " hertz"),
-    (r"\bkHz\b", " kilohertz"),
-    (r"\bMHz\b", " megahertz"),
-    (r"\bGHz\b", " gigahertz"),
-    (r"\bi\.e\.\b", " that is"),
-    (r"\be\.g\.\b", " for example"),
-    (r"\bet al\.\b", " et al"),
-]
-
-def normalize_for_tts(text: str) -> str:
-    out = text
-    for pat, rep in _ABBR_MAP:
-        out = re.sub(pat, rep, out, flags=re.IGNORECASE)
-    # collapse triple newlines → doubles (helps pacing, avoids empty clips)
-    out = re.sub(r"\n{3,}", "\n\n", out)
-    return out.strip()
-
-
-# ---------- chunking ----------
-def split_text(text: str, part_chars: int = 5200) -> List[str]:
-    """
-    Break text roughly on paragraph boundaries; hard split long paragraphs.
-    5.2k chars is safe for TTS latencies while still minimizing part count.
-    """
-    text = text.strip()
-    if len(text) <= part_chars:
-        return [text]
-
-    parts: List[str] = []
-    buf = ""
-    for para in re.split(r"\n{2,}", text):
-        para = para.strip()
-        if not para:
-            continue
-        if len(para) > part_chars:
-            # flush
-            if buf:
-                parts.append(buf); buf = ""
-            for i in range(0, len(para), part_chars):
-                parts.append(para[i:i+part_chars])
-            continue
-        if not buf:
-            buf = para
-        elif len(buf) + 2 + len(para) <= part_chars:
-            buf = f"{buf}\n\n{para}"
-        else:
-            parts.append(buf); buf = para
-    if buf:
-        parts.append(buf)
-    return parts
-
-
-# ---------- low-level OpenAI TTS (bytes) ----------
-def _tts_bytes_openai(client, text: str, voice: str) -> bytes:
-    """
-    Try streaming gpt-4o-mini-tts first; fallback to tts-1.
-    Returns raw MP3 bytes or raises.
-    """
-    # primary (streaming)
-    try:
-        with client.audio.speech.with_streaming_response.create(
-            model="gpt-4o-mini-tts",
-            voice=voice,
-            input=text,
-        ) as resp:
-            return resp.read()
-    except Exception:
-        pass
-    # fallback
-    try:
-        resp = client.audio.speech.create(
-            model="tts-1",
-            voice=voice,
-            input=text,
-        )
-        return resp.read()
-    except Exception as e:
-        raise e
-
-
-# ---------- main: one-shot single MP3 builder ----------
+# ---- Public API used by app.py ----
 def tts_to_single_mp3(
     client,
     text: str,
     voice: str = "alloy",
+    model: str = "tts-1",
     max_workers: int = 3,
+    max_chars_per_chunk: int = 3800,  # <= 4096 safe for TTS input
 ) -> bytes:
     """
-    1) normalizes text
-    2) splits into parts
-    3) synthesizes parts in parallel (OpenAI TTS)
-    4) concatenates in-memory with pydub to ONE MP3
-    Returns final MP3 bytes.
+    Splits 'text' into chunks, synthesizes each chunk to MP3 using OpenAI TTS,
+    then concatenates all MP3s into a single MP3 using ffmpeg's concat demuxer.
+    Returns MP3 bytes.
     """
-    clean = normalize_for_tts(text)
-    parts = split_text(clean, part_chars=5200)
+    chunks = _split_text(text, max_chars_per_chunk)
+    if not chunks:
+        raise ValueError("No text to synthesize.")
 
-    # synthesize in parallel → [(idx, bytes)]
-    results: List[Tuple[int, bytes]] = []
+    # 1) Synthesize chunks in parallel to temporary MP3 files
+    tmp_dir = tempfile.mkdtemp(prefix="rs_tts_")
+    mp3_paths: List[str] = []
+
+    def _synth(i_and_chunk):
+        i, ch = i_and_chunk
+        out_path = os.path.join(tmp_dir, f"part_{i:04d}.mp3")
+        # Use streaming API to write MP3 directly to disk
+        with client.audio.speech.with_streaming_response.create(
+            model=model,
+            voice=voice,
+            input=ch,
+        ) as resp:
+            resp.stream_to_file(out_path)
+        return out_path
+
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(_tts_bytes_openai, client, p, voice): i for i, p in enumerate(parts, 1)}
-        for fut in as_completed(futs):
-            idx = futs[fut]
-            audio = fut.result()
-            results.append((idx, audio))
-    results.sort(key=lambda x: x[0])
+        futures = [ex.submit(_synth, (i, ch)) for i, ch in enumerate(chunks)]
+        for f in as_completed(futures):
+            mp3_paths.append(f.result())
 
-    # stitch using pydub
-    combined = AudioSegment.empty()
-    for _, mp3_bytes in results:
-        seg = AudioSegment.from_file(io.BytesIO(mp3_bytes), format="mp3")
-        combined += seg
+    # Ensure files are ordered 0..N
+    mp3_paths.sort()
 
-    out = io.BytesIO()
-    combined.export(out, format="mp3")
-    return out.getvalue()
+    # 2) Concatenate with ffmpeg (no re-encoding, just stream copy)
+    list_txt = os.path.join(tmp_dir, "concat_list.txt")
+    with open(list_txt, "w", encoding="utf-8") as f:
+        for p in mp3_paths:
+            # ffmpeg concat requires exact "file 'path'"
+            f.write(f"file '{p}'\n")
+
+    final_mp3 = os.path.join(tmp_dir, "final.mp3")
+    _run_ffmpeg_concat(list_txt, final_mp3)
+
+    # 3) Read bytes, cleanup temp dir
+    with open(final_mp3, "rb") as f:
+        data = f.read()
+
+    _cleanup_dir(tmp_dir)
+    return data
+
+
+# ---- Helpers ----
+def _split_text(text: str, max_chars: int) -> List[str]:
+    """
+    Split on double newlines where possible, otherwise hard-wrap.
+    """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if len(text) <= max_chars:
+        return [text]
+
+    paras = re.split(r"\n{2,}", text)
+    chunks: List[str] = []
+    buf = ""
+
+    for para in paras:
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) > max_chars:
+            # flush buffer first
+            if buf:
+                chunks.append(buf); buf = ""
+            # hard split long paragraph
+            for i in range(0, len(para), max_chars):
+                chunks.append(para[i:i + max_chars])
+        else:
+            if not buf:
+                buf = para
+            elif len(buf) + 2 + len(para) <= max_chars:
+                buf = f"{buf}\n\n{para}"
+            else:
+                chunks.append(buf); buf = para
+
+    if buf:
+        chunks.append(buf)
+
+    return chunks
+
+
+def _run_ffmpeg_concat(list_file: str, out_path: str) -> None:
+    """
+    Uses ffmpeg concat demuxer to join MP3 files losslessly.
+    Requires 'ffmpeg' in PATH (Streamlit Cloud: install via packages.txt).
+    """
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-f", "concat",
+        "-safe", "0",
+        "-i", list_file,
+        "-c", "copy",
+        out_path,
+    ]
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"ffmpeg concat failed: {proc.stderr.strip()}")
+
+
+def _cleanup_dir(path: str) -> None:
+    try:
+        for root, dirs, files in os.walk(path, topdown=False):
+            for name in files:
+                try:
+                    os.remove(os.path.join(root, name))
+                except OSError:
+                    pass
+            for name in dirs:
+                try:
+                    os.rmdir(os.path.join(root, name))
+                except OSError:
+                    pass
+        os.rmdir(path)
+    except OSError:
+        pass
