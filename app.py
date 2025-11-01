@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from audio_utils import tts_to_single_mp3
 
 import streamlit as st
-
+from streamlit.components.v1 import html as st_html
 # ---- OpenAI client (official SDK) ----
 try:
     from openai import OpenAI
@@ -185,27 +185,6 @@ st.markdown(
 st.markdown("<h1>🎧 RoadScout</h1>", unsafe_allow_html=True)
 st.caption("Drop a podcast link below, hit go, and RoadScout spins a slick text + audio summary.")
 
-# Inline JS for completion ding
-st.markdown(
-    """
-    <script>
-    function rs_playDing(){
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = 'triangle';
-      o.frequency.value = 880; // A5
-      o.connect(g); g.connect(ctx.destination);
-      g.gain.setValueAtTime(0.0001, ctx.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.02);
-      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.45);
-      o.start(); o.stop(ctx.currentTime + 0.5);
-    }
-    </script>
-    """,
-    unsafe_allow_html=True,
-)
-
 # =========================
 # Secrets / API Key
 # =========================
@@ -238,6 +217,18 @@ def slugify(name: str, max_len: int = 80) -> str:
     name = re.sub(r"[^A-Za-z0-9 _-]+", "", name)
     name = name.replace(" ", "-")
     return name[:max_len] or "podcast"
+
+def play_ding():
+    """Plays a short beep using an embedded data URL (no external files, no JS)."""
+    _B64_BEEP = (
+        "UklGRvSJAABXQVZFZm10IBAAAAABAAEARKwAAIhYAQACABAAZGF0YdCJAAAAADMDWgZnCU4MBA99EbETlRUiF1IYIRmLGY0ZKhlhGDYXrhXOE58RKg93DJIJ"
+        "ZB9dH0YfQx9AHk0eLR2DHIYfhg2F3IVVRROEEwPTRC5P7w9vD8oPZg8CzwmOyo4Ojg2Nzc2NTYzNTEzNzQ2ODs+QURFR0lKTUxOT1BRUlNUVVZXWFlaW1xdX"
+        "l9gYWJjZGVmZ2hpa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJma"
+    )
+    st_html(
+        f'<audio autoplay style="display:none"><source src="data:audio/wav;base64,{_B64_BEEP}" type="audio/wav"></audio>',
+        height=0,
+    )
 
 # ---- Primary fetch using youtube-transcript-api ----
 def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = None) -> Tuple[str, List[Tuple[float, str]]]:
@@ -594,7 +585,7 @@ if go:
             status.update(label="Done", state="complete")
 
             if play_ding:
-                st.markdown("<script>rs_playDing()</script>", unsafe_allow_html=True)
+                play_ding()
 
             st.session_state.logs.append("Single MP3 ready.")
 
@@ -603,7 +594,7 @@ if go:
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
             st.session_state.logs.append(f"TTS failed: {type(e).__name__}: {e}")
             if play_ding:
-                st.markdown("<script>rs_playDing()</script>", unsafe_allow_html=True)
+                play_ding()
        
 
 # Diagnostics
