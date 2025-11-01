@@ -443,7 +443,7 @@ with st.sidebar:
     speed_mode = st.checkbox("Speed mode (use gpt-4o-mini for per-chunk)", value=True)
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
     tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)
-    play_ding = st.checkbox("Play a ding when finished", value=True)
+    should_play_ding = st.checkbox("Play a ding when finished", value=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 # Main inputs
@@ -584,7 +584,7 @@ if go:
 
             status.update(label="Done", state="complete")
 
-            if play_ding:
+            if should_play_ding:
                 play_ding()
 
             st.session_state.logs.append("Single MP3 ready.")
@@ -593,7 +593,7 @@ if go:
             status.update(label="Summary ready (audio failed)", state="complete")
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
             st.session_state.logs.append(f"TTS failed: {type(e).__name__}: {e}")
-            if play_ding:
+            if should_play_ding:
                 play_ding()
        
 
