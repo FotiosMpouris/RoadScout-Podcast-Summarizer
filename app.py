@@ -4,6 +4,7 @@ import io
 import zipfile
 from datetime import datetime
 from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import streamlit as st
 
@@ -43,22 +44,88 @@ except Exception as e:
 
 
 # =========================
-# App Config (mobile-friendly)
+# App Config + '70s Theme
 # =========================
 st.set_page_config(page_title="RoadScout: Podcast Summarizer", page_icon="🎧", layout="wide")
 st.markdown(
     """
     <style>
-    /* Slightly larger controls for mobile */
-    .stButton>button {font-size: 1.05rem; padding: 0.6rem 1rem;}
-    .stTextInput>div>div>input {font-size: 1rem;}
-    .stTextArea textarea {font-size: 0.95rem;}
+    @import url('https://fonts.googleapis.com/css2?family=Shrikhand&family=Kalam:wght@400;700&display=swap');
+
+    :root{
+      --rs-yellow:#FFD166;
+      --rs-orange:#F25C05;
+      --rs-red:#EF476F;
+      --rs-teal:#06D6A0;
+      --rs-deep:#073B4C;
+      --rs-cream:#FFF7E6;
+    }
+
+    /* Groovy gradient background */
+    .stApp {
+      background: radial-gradient(circle at 15% 20%, var(--rs-yellow), transparent 40%),
+                  radial-gradient(circle at 85% 30%, var(--rs-orange), transparent 45%),
+                  radial-gradient(circle at 30% 80%, var(--rs-teal), transparent 45%),
+                  linear-gradient(120deg, #fff, var(--rs-cream));
+    }
+
+    h1, .stMarkdown h1 { font-family: 'Shrikhand', cursive; color: var(--rs-deep); letter-spacing: 1px; }
+    .stSidebar h2, .stSidebar h3 { font-family: 'Kalam', cursive; }
+
+    /* Cards */
+    .rs-card {
+      background: #ffffffd9;
+      border: 3px solid var(--rs-deep);
+      border-radius: 18px;
+      padding: 1rem 1.1rem;
+      box-shadow: 6px 6px 0 var(--rs-deep);
+      margin: 0.6rem 0 1rem 0;
+    }
+    .rs-title {
+      font-family: 'Kalam', cursive;
+      font-weight: 700;
+      font-size: 1.05rem;
+      color: var(--rs-deep);
+      display: inline-flex;
+      gap: .5rem;
+      align-items: center;
+    }
+    .rs-chip { display:inline-block; padding:.15rem .55rem; border-radius:999px; font-size:.8rem; margin-left:.25rem; }
+    .rs-chip.yellow{ background:var(--rs-yellow); }
+    .rs-chip.orange{ background:var(--rs-orange); color:white;}
+    .rs-chip.teal{ background:var(--rs-teal); }
+    .rs-section { border-top: 2px dashed var(--rs-deep); margin-top: .75rem; padding-top: .75rem;}
+    .stButton>button {font-size: 1.05rem; padding: 0.6rem 1rem; border-radius: 14px; border:2px solid var(--rs-deep); box-shadow: 4px 4px 0 var(--rs-deep);}
+    .stTextInput>div>div>input, .stTextArea textarea {font-size: 1rem;}
+    .element-container:has(audio){ background:#fff; border-radius:12px; padding:.3rem .5rem; border:1px solid #ddd;}
     </style>
     """,
     unsafe_allow_html=True,
 )
-st.title("🎧 RoadScout: Podcast Summarizer")
+
+st.markdown("<h1>🎧 RoadScout</h1>", unsafe_allow_html=True)
 st.caption("Paste a podcast/YouTube URL (or transcript), tap once, and get a persona-driven text + audio summary.")
+
+# Inline JS for completion ding
+st.markdown(
+    """
+    <script>
+    function rs_playDing(){
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = ctx.createOscillator();
+      const g = ctx.createGain();
+      o.type = 'triangle';
+      o.frequency.value = 880; // A5
+      o.connect(g); g.connect(ctx.destination);
+      g.gain.setValueAtTime(0.0001, ctx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.2, ctx.currentTime + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 0.45);
+      o.start(); o.stop(ctx.currentTime + 0.5);
+    }
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
 
 # =========================
 # Secrets / API Key
@@ -89,16 +156,9 @@ def slugify(name: str, max_len: int = 80) -> str:
 
 # ---- Primary fetch using youtube-transcript-api ----
 def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = None) -> Tuple[str, List[Tuple[float, str]]]:
-    """
-    Robust transcript fetcher with youtube-transcript-api:
-    - Try official captions first
-    - Then try auto-generated captions
-    Returns (joined_text, [(start_seconds, text), ...])
-    """
     if YouTubeTranscriptApi is None:
         raise RuntimeError("youtube-transcript-api is not installed on this deployment.")
     languages = languages or ["en", "en-US", "en-GB"]
-
     try:
         data = YouTubeTranscriptApi.get_transcript(video_id, languages=languages)
     except Exception:
@@ -122,9 +182,7 @@ def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = Non
     timeline = [(item["start"], item["text"]) for item in data]
     joined = " ".join(seg for _, seg in timeline).strip()
     if not joined:
-        raise CouldNotRetrieveTranscript(
-            "Transcript fetch returned empty content (YouTube may be blocking or captions are disabled)."
-        )
+        raise CouldNotRetrieveTranscript("Transcript fetch returned empty content.")
     return joined, timeline
 
 # ---- Fallback fetch using yt-dlp + VTT parsing ----
@@ -154,10 +212,6 @@ def _parse_vtt(vtt_text: str) -> List[Tuple[float, str]]:
     return result
 
 def fetch_info_and_captions_via_ytdlp(url: str) -> Tuple[str, Optional[str], List[Tuple[float, str]]]:
-    """
-    Uses yt-dlp to get title and captions (official/auto) as VTT.
-    Returns (joined_text, title, timeline)
-    """
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed on this deployment.")
     ydl_opts = {"quiet": True, "skip_download": True, "writesubtitles": True, "writeautomaticsub": True}
@@ -191,11 +245,9 @@ def fetch_info_and_captions_via_ytdlp(url: str) -> Tuple[str, Optional[str], Lis
         raise CouldNotRetrieveTranscript("Empty VTT content.")
     return joined, title, timeline
 
-def chunk_text(text: str, max_chars: int = 20000) -> List[str]:
+def chunk_text(text: str, max_chars: int = 24000) -> List[str]:
     """
-    Split transcript into ~max_chars chunks.
-    Prefers paragraph breaks, but hard-splits long paragraphs so we never
-    end up with a single huge chunk.
+    Larger chunks reduce API calls. Hard-splits ensure we never ship a giant block.
     """
     text = text.strip()
     if len(text) <= max_chars:
@@ -228,34 +280,39 @@ def chunk_text(text: str, max_chars: int = 20000) -> List[str]:
 
 def summarize_transcript(transcript: str,
                          persona_prompt: str,
-                         model: str = "gpt-4.1",
+                         model_merge_and_fit: str = "gpt-4.1",
+                         model_per_chunk: Optional[str] = None,
                          temperature: float = 0.2,
                          log=None) -> str:
-    """Chunked summarize + merge."""
-    chunks = chunk_text(transcript, max_chars=20000)
+    """
+    Summarize each chunk with model_per_chunk (defaults to merge model if None),
+    then merge+fit with model_merge_and_fit.
+    """
+    chunks = chunk_text(transcript, max_chars=24000)
     if log: log(f"Transcript length: {len(transcript):,} chars → {len(chunks)} chunk(s).")
     intermediates: List[str] = []
+    per_chunk_model = model_per_chunk or model_merge_and_fit
 
     for i, ch in enumerate(chunks, 1):
-        if log: log(f"Summarizing chunk {i}/{len(chunks)} ({len(ch):,} chars)…")
+        if log: log(f"Summarizing chunk {i}/{len(chunks)} ({len(ch):,} chars) with {per_chunk_model}…")
         messages = [
             {"role": "system", "content": persona_prompt},
             {"role": "user", "content": f"TRANSCRIPT CHUNK {i}/{len(chunks)}:\n\n{ch}\n\nProvide a compact intermediate summary (bulleted where helpful)."}
         ]
         resp = client.chat.completions.create(
-            model=model,
+            model=per_chunk_model,
             messages=messages,
             temperature=temperature,
         )
         intermediates.append(resp.choices[0].message.content.strip())
 
-    if log: log("Merging intermediate summaries…")
+    if log: log(f"Merging {len(intermediates)} summaries with {model_merge_and_fit}…")
     merge_messages = [
         {"role": "system", "content": persona_prompt},
         {"role": "user", "content": "Merge the following intermediate summaries into a single cohesive final report. Remove redundancies, keep structure, and ensure chronology and lenses are clear:\n\n" + "\n\n---\n\n".join(intermediates)}
     ]
     final_resp = client.chat.completions.create(
-        model=model,
+        model=model_merge_and_fit,
         messages=merge_messages,
         temperature=temperature,
     )
@@ -263,7 +320,6 @@ def summarize_transcript(transcript: str,
 
 # ==== Length control ====
 def estimate_words_from_minutes(minutes: int, wpm: int = 170) -> int:
-    """Target words for the final summary (aloud)."""
     return max(200, int(minutes * wpm))
 
 def fit_summary_to_length(raw_md: str,
@@ -272,11 +328,9 @@ def fit_summary_to_length(raw_md: str,
                           model: str,
                           temperature: float,
                           log=None) -> str:
-    """Final 'fit' pass: compress/expand to ~N words while keeping structure."""
     target_words = estimate_words_from_minutes(target_minutes)
-    if log: log(f"Fitting summary to ~{target_words} words (≈{target_minutes} min at ~170 wpm).")
-    soft_token_cap = int(target_words * 1.4) + 200  # generous cap
-
+    if log: log(f"Fitting summary to ~{target_words} words (≈{target_minutes} min @170 wpm).")
+    soft_token_cap = int(target_words * 1.4) + 200
     messages = [
         {"role": "system", "content": persona_prompt},
         {"role": "user", "content":
@@ -295,9 +349,8 @@ SUMMARY TO ADJUST:
     )
     return resp.choices[0].message.content.strip()
 
-# ---------- FULL-LENGTH AUDIO (multipart) ----------
-def split_for_tts(text: str, part_chars: int = 4500) -> List[str]:
-    """Split on paragraph boundaries when possible; hard-split if needed."""
+# ---------- FULL-LENGTH AUDIO (multipart + parallel) ----------
+def split_for_tts(text: str, part_chars: int = 5500) -> List[str]:
     text = text.strip()
     if len(text) <= part_chars:
         return [text]
@@ -324,10 +377,6 @@ def split_for_tts(text: str, part_chars: int = 4500) -> List[str]:
     return parts
 
 def _tts_bytes(text: str, voice: str, log=None) -> bytes:
-    """
-    TTS wrapper compatible with your SDK variant (no 'format' kwarg).
-    Tries streaming first, then non-streaming, then tts-1.
-    """
     try:
         if log: log("TTS streaming (primary)")
         with client.audio.speech.with_streaming_response.create(
@@ -356,31 +405,25 @@ def _tts_bytes(text: str, voice: str, log=None) -> bytes:
     ) as resp:
         return resp.read()
 
-def tts_multipart(summary_md: str, voice: str, log=None) -> List[Tuple[str, bytes]]:
-    """Produce multiple MP3 parts and return [(filename, bytes), ...]."""
-    parts_text = split_for_tts(summary_md, part_chars=4500)
-    if log: log(f"TTS will generate {len(parts_text)} part(s).")
-    results: List[Tuple[str, bytes]] = []
-    for idx, pt in enumerate(parts_text, 1):
-        if log: log(f"TTS Part {idx} ({len(pt)} chars)")
-        audio = _tts_bytes(pt, voice=voice, log=log)
-        results.append((f"roadscout_summary_part{idx}.mp3", audio))
+def tts_multipart_parallel(summary_md: str, voice: str, max_workers: int = 3, log=None) -> List[Tuple[int, bytes]]:
+    parts_text = split_for_tts(summary_md, part_chars=5500)
+    if log: log(f"TTS will generate {len(parts_text)} part(s) in parallel ({max_workers} workers).")
+    results: List[Tuple[int, bytes]] = []
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(_tts_bytes, pt, voice, log): idx for idx, pt in enumerate(parts_text, 1)}
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            audio = fut.result()
+            results.append((idx, audio))
+    results.sort(key=lambda x: x[0])
     return results
 
-def zip_parts(parts: List[Tuple[str, bytes]]) -> bytes:
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for fname, b in parts:
-            zf.writestr(fname, b)
-    mem.seek(0)
-    return mem.read()
-
 
 # =========================
-# UI – one-click flow
+# Sidebar – controls
 # =========================
 with st.sidebar:
-    st.subheader("Summary Settings")
+    st.markdown('<div class="rs-card"><span class="rs-title">🎛️ Controls <span class="rs-chip teal">New</span></span>', unsafe_allow_html=True)
     tone = st.selectbox(
         "Tone",
         ["clear and professional", "friendly and concise", "analytical and direct", "executive brief"],
@@ -389,19 +432,22 @@ with st.sidebar:
     target_minutes = st.slider("Target read length (minutes)", 5, 25, 12, 1)
     include_ts = st.checkbox("Include timestamps when possible", value=True)
     extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
-    # Default to gpt-4.1 as requested
-    model_choice = st.selectbox("Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
+    model_choice = st.selectbox("Merge/Fit Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
+    speed_mode = st.checkbox("Speed mode (use gpt-4o-mini for per-chunk)", value=True)
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
     tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)
+    play_ding = st.checkbox("Play a ding when finished", value=True)
+    st.markdown('</div>', unsafe_allow_html=True)
 
-# Single input + single button
-url = st.text_input("Paste podcast / episode URL (YouTube best for auto-transcript):").strip()
-manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=140)
+# Main inputs
+st.markdown('<div class="rs-card"><span class="rs-title">🔗 Input</span><span class="rs-chip yellow">One-click</span><div class="rs-section"></div>', unsafe_allow_html=True)
+url = st.text_input("Paste podcast / episode URL (YouTube works best for auto-transcript):").strip()
+manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=130)
+st.markdown('</div>', unsafe_allow_html=True)
 
-# Bigger, mobile-friendly primary action
 go = st.button("Summarize & Play ▶️", use_container_width=True)
 
-# Simple in-app logger
+# Logger
 if "logs" not in st.session_state:
     st.session_state.logs = []
 def log(msg: str):
@@ -409,18 +455,17 @@ def log(msg: str):
 
 # ============ One-click handler ============
 if go:
-    st.session_state.logs = []  # reset
+    st.session_state.logs = []
     transcript_text: Optional[str] = None
     timeline: Optional[List[Tuple[float, str]]] = None
     episode_title: Optional[str] = None
 
     with st.status("Working…", expanded=True) as status:
-        # 1) Get transcript: URL → YT API → yt-dlp fallback → manual
+        # 1) Transcript
         if url:
             vid = extract_youtube_id(url)
             if vid:
                 log(f"Detected YouTube ID: {vid}")
-                # Primary: youtube-transcript-api
                 try:
                     transcript_text, timeline = fetch_youtube_transcript(vid)
                     log(f"[yt-transcript-api] OK – {len(transcript_text):,} chars.")
@@ -430,45 +475,39 @@ if go:
                     log(f"[yt-transcript-api] Empty/blocked: {e}")
                 except Exception as e:
                     log(f"[yt-transcript-api] Unexpected: {type(e).__name__}: {e}")
-
-                # Fallback: yt-dlp captions + title
                 if not transcript_text:
                     try:
-                        if yt_dlp is None:
-                            raise RuntimeError("yt-dlp not installed")
                         transcript_text, episode_title, timeline = fetch_info_and_captions_via_ytdlp(url)
                         log(f"[yt-dlp] captions OK – {len(transcript_text):,} chars.")
-                        if episode_title:
-                            log(f"Title: {episode_title}")
+                        if episode_title: log(f"Title: {episode_title}")
                     except Exception as e:
                         log(f"[yt-dlp] fallback failed: {type(e).__name__}: {e}")
             else:
-                log("URL is not YouTube; auto-fetch not supported yet. Will use manual transcript if provided.")
-        else:
-            log("No URL provided; will use manual transcript if provided.")
-
+                log("URL is not YouTube; manual transcript only for now.")
         if not transcript_text:
             if manual.strip():
                 transcript_text = manual.strip()
                 log(f"Using manual transcript: {len(transcript_text):,} chars.")
             else:
                 status.update(label="Need a transcript", state="error")
-                st.error("Could not obtain a transcript. Paste one in the text area and click again.")
+                st.error("Could not obtain a transcript. Paste one and click again.")
                 st.stop()
 
-        # 2) Build persona + summarize
+        # 2) Persona + summarize (speed mode uses mini for chunks)
         persona = build_persona_prompt(
             style=tone,
             target_minutes=target_minutes,
             include_timestamps=include_ts,
             extra_focus=[s.strip() for s in extra_focus.split(",")] if extra_focus else []
         )
-        log("Persona prompt constructed.")
+        log("Persona prompt ready.")
         try:
+            per_chunk_model = "gpt-4o-mini" if speed_mode else None
             summary_md = summarize_transcript(
                 transcript=transcript_text,
                 persona_prompt=persona,
-                model=model_choice,
+                model_merge_and_fit=model_choice,
+                model_per_chunk=per_chunk_model,
                 temperature=temperature,
                 log=log
             )
@@ -487,26 +526,21 @@ if go:
             st.error(f"Summarization failed: {type(e).__name__}: {e}")
             st.stop()
 
-        # 3) Render summary + download (title-aware filename)
-        st.success("Summary")
+        # 3) Render summary & download
+        st.markdown('<div class="rs-card"><span class="rs-title">📝 End of Report</span><div class="rs-section"></div>', unsafe_allow_html=True)
         st.markdown(summary_md)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = slugify(episode_title or "roadscout-summary")
         md_bytes = io.BytesIO(summary_md.encode("utf-8"))
-        st.download_button(
-            label="Download summary (.md)",
-            data=md_bytes,
-            file_name=f"{base}_{ts}.md",
-            mime="text/markdown"
-        )
+        st.download_button("Download summary (.md)", md_bytes, file_name=f"{base}_{ts}.md", mime="text/markdown")
+        st.markdown('</div>', unsafe_allow_html=True)
 
-        # 4) Auto-generate audio summary (multipart, no truncation)
+        # 4) Audio summary (parallel parts)
         try:
-            log("Generating audio summary parts…")
-            parts = tts_multipart(summary_md, voice=tts_voice, log=log)
+            log("Generating audio summary (parallel parts)…")
+            parts = tts_multipart_parallel(summary_md, voice=tts_voice, max_workers=3, log=log)
 
-            # Show inline players + per-part downloads
-            for i, (fname, audio_bytes) in enumerate(parts, 1):
+            for i, audio_bytes in parts:
                 st.audio(audio_bytes, format="audio/mp3")
                 st.download_button(
                     f"Download Part {i} (.mp3)",
@@ -516,32 +550,29 @@ if go:
                     key=f"dl_part_{i}"
                 )
 
-            # One-click ZIP for car rides
             zip_mem = io.BytesIO()
             with zipfile.ZipFile(zip_mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-                for i, (fname, audio_bytes) in enumerate(parts, 1):
+                for i, audio_bytes in parts:
                     zf.writestr(f"{base}_{ts}_part{i}.mp3", audio_bytes)
             zip_mem.seek(0)
-            st.download_button(
-                "Download all parts (.zip)",
-                data=zip_mem.read(),
-                file_name=f"{base}_{ts}.zip",
-                mime="application/zip"
-            )
+            st.download_button("Download all parts (.zip)", zip_mem.read(), file_name=f"{base}_{ts}.zip", mime="application/zip")
 
-            log("Audio parts ready.")
             status.update(label="Done", state="complete")
+            if play_ding:
+                st.markdown("<script>rs_playDing()</script>", unsafe_allow_html=True)
+            log("Audio parts ready.")
         except Exception as e:
-            log(f"TTS failed: {type(e).__name__}: {e}")
             status.update(label="Summary ready (audio failed)", state="complete")
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
+            if play_ding:
+                st.markdown("<script>rs_playDing()</script>", unsafe_allow_html=True)
+            log(f"TTS failed: {type(e).__name__}: {e}")
 
-# Diagnostics (collapsed by default for mobile sanity)
+# Diagnostics
 with st.expander("Diagnostics (click to view logs)"):
     if st.session_state.logs:
         st.code("\n".join(st.session_state.logs))
     else:
         st.write("No logs yet. Paste a URL or transcript and tap **Summarize & Play ▶️**.")
 
-# Footer
 st.caption("Notes: YouTube sometimes blocks transcripts (rate limits/region/captions off). For non-YouTube podcasts, paste transcript for now.")
