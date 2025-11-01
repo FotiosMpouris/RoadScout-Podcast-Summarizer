@@ -3,7 +3,5 @@ openai>=1.0
 youtube-transcript-api>=0.6.2
 yt-dlp>=2024.7.16
 requests>=2.31
-pydub>=0.25.1
-pyaudioop>=0.1.2
 
 
