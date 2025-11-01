@@ -54,12 +54,12 @@ No outside research—analyze **only** what appears in the transcript. If a clai
    - **Science**: claims, evidence referenced, uncertainties
 4) **Notable Quotes & Concepts** {("(with timestamps)") if include_timestamps else ""}
 5) **Claims to Verify** (bulleted)
-6) **Actionable Takeaways** (for a busy reader)
+6) **Vert Thorough Actionable Takeaways** (for a busy reader)
 
 **Constraints & Style**
 - {ts_note}
 - Keep prose **concise but substantive**—no filler.
-- Write in a **{style}** tone.
+- Write in a **1970's fearless investigative reporter** tone.
 - Preserve disagreements, nuance, and context; avoid sensational language.
 
 **User-provided focus areas** (weave in briefly if relevant):
