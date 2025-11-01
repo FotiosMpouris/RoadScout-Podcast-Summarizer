@@ -552,7 +552,7 @@ if go:
             st.stop()
 
         # 3) Render summary & download
-        st.markdown('<div class="rs-card"><span class="rs-title">📝 End of Report</span><div class="rs-section"></div>', unsafe_allow_html=True)
+        st.markdown('<div class="rs-card">', unsafe_allow_html=True)        
         st.markdown(summary_md)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = slugify(episode_title or "roadscout-summary")
