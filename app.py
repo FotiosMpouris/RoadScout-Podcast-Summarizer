@@ -1,6 +1,8 @@
 import os
 import re
 import io
+import zipfile
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 import streamlit as st
@@ -12,7 +14,7 @@ except ImportError:
     st.error("Missing OpenAI SDK. Make sure 'openai' is in requirements.txt.")
     st.stop()
 
-# ---- YouTube transcript fetchers ----
+# ---- YouTube transcript (primary) ----
 try:
     from youtube_transcript_api import (
         YouTubeTranscriptApi,
@@ -23,10 +25,10 @@ try:
 except Exception:
     YouTubeTranscriptApi = None  # degrade gracefully
 
+# ---- Fallback caption discovery/downloader ----
 import requests
 from requests.exceptions import RequestException
 
-# yt-dlp for fallback caption discovery
 try:
     import yt_dlp
 except Exception:
@@ -39,12 +41,24 @@ except Exception as e:
     st.error(f"Could not import prompts.py: {e}")
     st.stop()
 
+
 # =========================
-# App Config
+# App Config (mobile-friendly)
 # =========================
 st.set_page_config(page_title="RoadScout: Podcast Summarizer", page_icon="🎧", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* Slightly larger controls for mobile */
+    .stButton>button {font-size: 1.05rem; padding: 0.6rem 1rem;}
+    .stTextInput>div>div>input {font-size: 1rem;}
+    .stTextArea textarea {font-size: 0.95rem;}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 st.title("🎧 RoadScout: Podcast Summarizer")
-st.caption("Paste a podcast/YouTube URL (or transcript), click once, and get a persona-driven text + audio summary.")
+st.caption("Paste a podcast/YouTube URL (or transcript), tap once, and get a persona-driven text + audio summary.")
 
 # =========================
 # Secrets / API Key
@@ -54,6 +68,7 @@ if not OPENAI_API_KEY:
     st.error("No OPENAI_API_KEY detected. Add it in Streamlit → Settings → Secrets.")
     st.stop()
 client = OpenAI(api_key=OPENAI_API_KEY)
+
 
 # =========================
 # Helpers
@@ -65,6 +80,12 @@ YOUTUBE_REGEX = re.compile(
 def extract_youtube_id(url: str) -> Optional[str]:
     m = YOUTUBE_REGEX.search(url.strip())
     return m.group(1) if m else None
+
+def slugify(name: str, max_len: int = 80) -> str:
+    name = re.sub(r"\s+", " ", name).strip()
+    name = re.sub(r"[^A-Za-z0-9 _-]+", "", name)
+    name = name.replace(" ", "-")
+    return name[:max_len] or "podcast"
 
 # ---- Primary fetch using youtube-transcript-api ----
 def fetch_youtube_transcript(video_id: str, languages: Optional[List[str]] = None) -> Tuple[str, List[Tuple[float, str]]]:
@@ -112,10 +133,6 @@ VTT_TS = re.compile(
 )
 
 def _parse_vtt(vtt_text: str) -> List[Tuple[float, str]]:
-    """
-    Very small WebVTT parser (enough for YouTube subs).
-    Returns [(start_seconds, text)]
-    """
     lines = vtt_text.splitlines()
     result: List[Tuple[float, str]] = []
     i = 0
@@ -123,11 +140,9 @@ def _parse_vtt(vtt_text: str) -> List[Tuple[float, str]]:
         line = lines[i].strip()
         m = VTT_TS.match(line)
         if m:
-            # collect caption text until blank line
             text_lines = []
             i += 1
             while i < len(lines) and lines[i].strip():
-                # strip simple VTT tags like <c> or <i>
                 text_lines.append(re.sub(r"<[^>]+>", "", lines[i]).strip())
                 i += 1
             start = int(m.group("h")) * 3600 + int(m.group("m")) * 60 + float(m.group("s"))
@@ -138,25 +153,21 @@ def _parse_vtt(vtt_text: str) -> List[Tuple[float, str]]:
             i += 1
     return result
 
-def fetch_youtube_transcript_via_ytdlp(url: str) -> Tuple[str, List[Tuple[float, str]]]:
+def fetch_info_and_captions_via_ytdlp(url: str) -> Tuple[str, Optional[str], List[Tuple[float, str]]]:
     """
-    Uses yt-dlp to locate captions (official or auto) and downloads VTT to parse.
+    Uses yt-dlp to get title and captions (official/auto) as VTT.
+    Returns (joined_text, title, timeline)
     """
     if yt_dlp is None:
         raise RuntimeError("yt-dlp is not installed on this deployment.")
-    ydl_opts = {
-        "quiet": True,
-        "skip_download": True,
-        "writesubtitles": True,
-        "writeautomaticsub": True,
-    }
+    ydl_opts = {"quiet": True, "skip_download": True, "writesubtitles": True, "writeautomaticsub": True}
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=False)
-    # Prefer official English subs, then auto English, then any English
+    title = info.get("title")
+
     def pick_track(container: dict, key: str) -> Optional[str]:
         if not container or key not in container:
             return None
-        # Try exact 'en' first; else any 'en-*'
         if "en" in container[key]:
             tracks = container[key]["en"]
         else:
@@ -164,28 +175,23 @@ def fetch_youtube_transcript_via_ytdlp(url: str) -> Tuple[str, List[Tuple[float,
             if not lang:
                 return None
             tracks = container[key][lang]
-        # Prefer VTT
         vtt = next((t for t in tracks if t.get("ext") == "vtt"), None)
         if vtt:
             return vtt.get("url")
         return tracks[0].get("url") if tracks else None
 
-    vtt_url = (pick_track(info, "subtitles")
-               or pick_track(info, "automatic_captions"))
+    vtt_url = (pick_track(info, "subtitles") or pick_track(info, "automatic_captions"))
     if not vtt_url:
         raise NoTranscriptFound("No captions found via yt-dlp.")
-    try:
-        r = requests.get(vtt_url, timeout=15)
-        r.raise_for_status()
-        timeline = _parse_vtt(r.text)
-        joined = " ".join(seg for _, seg in timeline).strip()
-        if not joined:
-            raise CouldNotRetrieveTranscript("Empty VTT content.")
-        return joined, timeline
-    except RequestException as e:
-        raise CouldNotRetrieveTranscript(f"Failed to download captions: {e}")
+    r = requests.get(vtt_url, timeout=15)
+    r.raise_for_status()
+    timeline = _parse_vtt(r.text)
+    joined = " ".join(seg for _, seg in timeline).strip()
+    if not joined:
+        raise CouldNotRetrieveTranscript("Empty VTT content.")
+    return joined, title, timeline
 
-def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
+def chunk_text(text: str, max_chars: int = 20000) -> List[str]:
     """
     Split transcript into ~max_chars chunks.
     Prefers paragraph breaks, but hard-splits long paragraphs so we never
@@ -195,7 +201,7 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
     if len(text) <= max_chars:
         return [text]
 
-    paras = re.split(r"\n{2,}", text)  # may be a single element for VTT-joined text
+    paras = re.split(r"\n{2,}", text)
     chunks: List[str] = []
     buf = ""
 
@@ -203,82 +209,30 @@ def chunk_text(text: str, max_chars: int = 12000) -> List[str]:
         para = para.strip()
         if not para:
             continue
-
-        # If a single paragraph itself is too large, hard-split it.
         if len(para) > max_chars:
-            # flush current buffer first
             if buf:
-                chunks.append(buf)
-                buf = ""
+                chunks.append(buf); buf = ""
             for i in range(0, len(para), max_chars):
-                piece = para[i:i + max_chars]
-                chunks.append(piece)
+                chunks.append(para[i:i + max_chars])
             continue
-
-        # Normal packing into the buffer
         if not buf:
             buf = para
         elif len(buf) + 2 + len(para) <= max_chars:
             buf = f"{buf}\n\n{para}"
         else:
-            chunks.append(buf)
-            buf = para
+            chunks.append(buf); buf = para
 
     if buf:
         chunks.append(buf)
-
     return chunks
-
-
-# ==== Length control ====
-def estimate_words_from_minutes(minutes: int, wpm: int = 160) -> int:
-    """Target words for the final summary (aloud)."""
-    return max(200, int(minutes * wpm))
-
-def fit_summary_to_length(raw_md: str,
-                          persona_prompt: str,
-                          target_minutes: int,
-                          model: str,
-                          temperature: float,
-                          log=None) -> str:
-    """
-    Final 'fit' pass: compress/expand the merged summary to ~N words.
-    Uses a short instruction to avoid losing structure.
-    """
-    target_words = estimate_words_from_minutes(target_minutes)
-    if log: log(f"Fitting summary to ~{target_words} words (≈{target_minutes} min at ~160 wpm).")
-
-    # Keep structure but aim for target words. Use max_tokens as a soft cap.
-    # Rough conversion: 1 word ≈ 1.3 tokens → add slack.
-    soft_token_cap = int(target_words * 1.4) + 200
-
-    messages = [
-        {"role": "system", "content": persona_prompt},
-        {"role": "user", "content":
-            f"""Rewrite the following summary to approximately {target_words} words (±10%) while retaining the same section structure and key points.
-Keep it concise but substantive; do not remove mandatory headings.
-
-SUMMARY TO ADJUST:
-{raw_md}
-"""}
-    ]
-    resp = client.chat.completions.create(
-        model=model,
-        messages=messages,
-        temperature=temperature,
-        # The SDK variant you’re on uses 'max_tokens' for chat completion output caps:
-        max_tokens=soft_token_cap
-    )
-    return resp.choices[0].message.content.strip()
-
 
 def summarize_transcript(transcript: str,
                          persona_prompt: str,
-                         model: str = "gpt-4o-mini",
+                         model: str = "gpt-4.1",
                          temperature: float = 0.2,
                          log=None) -> str:
     """Chunked summarize + merge."""
-    chunks = chunk_text(transcript, max_chars=12000)
+    chunks = chunk_text(transcript, max_chars=20000)
     if log: log(f"Transcript length: {len(transcript):,} chars → {len(chunks)} chunk(s).")
     intermediates: List[str] = []
 
@@ -307,64 +261,120 @@ def summarize_transcript(transcript: str,
     )
     return final_resp.choices[0].message.content.strip()
 
-def tts_from_text(text: str,
-                  model: str = "gpt-4o-mini-tts",
-                  voice: str = "alloy",
-                  max_chars: int = 8000,
-                  log=None) -> bytes:
-    """
-    Create an MP3 from text using OpenAI TTS.
-    Uses streaming response; no 'format' kwarg (SDK variant).
-    Falls back to tts-1 if needed.
-    """
-    safe = text.strip()
-    if len(safe) > max_chars:
-        if log: log(f"TTS truncating from {len(safe):,} → {max_chars:,} chars for faster playback.")
-        safe = safe[:max_chars] + "\n\n[...truncated for audio length...]"
+# ==== Length control ====
+def estimate_words_from_minutes(minutes: int, wpm: int = 170) -> int:
+    """Target words for the final summary (aloud)."""
+    return max(200, int(minutes * wpm))
 
-    # Try streaming on gpt-4o-mini-tts
+def fit_summary_to_length(raw_md: str,
+                          persona_prompt: str,
+                          target_minutes: int,
+                          model: str,
+                          temperature: float,
+                          log=None) -> str:
+    """Final 'fit' pass: compress/expand to ~N words while keeping structure."""
+    target_words = estimate_words_from_minutes(target_minutes)
+    if log: log(f"Fitting summary to ~{target_words} words (≈{target_minutes} min at ~170 wpm).")
+    soft_token_cap = int(target_words * 1.4) + 200  # generous cap
+
+    messages = [
+        {"role": "system", "content": persona_prompt},
+        {"role": "user", "content":
+            f"""Rewrite the following summary to approximately {target_words} words (±10%) while retaining the same section structure and key points.
+Keep it concise but substantive; do not remove mandatory headings.
+
+SUMMARY TO ADJUST:
+{raw_md}
+"""}
+    ]
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=soft_token_cap
+    )
+    return resp.choices[0].message.content.strip()
+
+# ---------- FULL-LENGTH AUDIO (multipart) ----------
+def split_for_tts(text: str, part_chars: int = 4500) -> List[str]:
+    """Split on paragraph boundaries when possible; hard-split if needed."""
+    text = text.strip()
+    if len(text) <= part_chars:
+        return [text]
+    parts: List[str] = []
+    buf = ""
+    for para in re.split(r"\n{2,}", text):
+        para = para.strip()
+        if not para:
+            continue
+        if len(para) > part_chars:
+            if buf:
+                parts.append(buf); buf = ""
+            for i in range(0, len(para), part_chars):
+                parts.append(para[i:i+part_chars])
+            continue
+        if not buf:
+            buf = para
+        elif len(buf) + 2 + len(para) <= part_chars:
+            buf = f"{buf}\n\n{para}"
+        else:
+            parts.append(buf); buf = para
+    if buf:
+        parts.append(buf)
+    return parts
+
+def _tts_bytes(text: str, voice: str, log=None) -> bytes:
+    """
+    TTS wrapper compatible with your SDK variant (no 'format' kwarg).
+    Tries streaming first, then non-streaming, then tts-1.
+    """
     try:
-        if log: log(f"TTS (streaming) model={model}, voice={voice}")
+        if log: log("TTS streaming (primary)")
         with client.audio.speech.with_streaming_response.create(
-            model=model,
+            model="gpt-4o-mini-tts",
             voice=voice,
-            input=safe,
+            input=text,
         ) as resp:
-            return resp.read()  # bytes
+            return resp.read()
     except Exception as e:
-        if log: log(f"TTS streaming failed on {model}: {e}")
-
-    # Fallback to non-streaming create (still without 'format')
+        if log: log(f"TTS streaming failed: {e}")
     try:
-        if log: log(f"TTS (create) model={model}, voice={voice}")
+        if log: log("TTS create() (secondary)")
         resp = client.audio.speech.create(
-            model=model,
+            model="gpt-4o-mini-tts",
             voice=voice,
-            input=safe,
+            input=text,
         )
         return resp.read()
     except Exception as e:
-        if log: log(f"TTS create() failed on {model}: {e}")
-
-    # Final fallback to classic tts-1 (streaming)
+        if log: log(f"TTS create() failed: {e}")
     if log: log("TTS fallback to tts-1")
     with client.audio.speech.with_streaming_response.create(
         model="tts-1",
         voice=voice,
-        input=safe,
+        input=text,
     ) as resp:
         return resp.read()
 
+def tts_multipart(summary_md: str, voice: str, log=None) -> List[Tuple[str, bytes]]:
+    """Produce multiple MP3 parts and return [(filename, bytes), ...]."""
+    parts_text = split_for_tts(summary_md, part_chars=4500)
+    if log: log(f"TTS will generate {len(parts_text)} part(s).")
+    results: List[Tuple[str, bytes]] = []
+    for idx, pt in enumerate(parts_text, 1):
+        if log: log(f"TTS Part {idx} ({len(pt)} chars)")
+        audio = _tts_bytes(pt, voice=voice, log=log)
+        results.append((f"roadscout_summary_part{idx}.mp3", audio))
+    return results
 
+def zip_parts(parts: List[Tuple[str, bytes]]) -> bytes:
+    mem = io.BytesIO()
+    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for fname, b in parts:
+            zf.writestr(fname, b)
+    mem.seek(0)
+    return mem.read()
 
-def timeline_preview(tl: List[Tuple[float, str]]) -> str:
-    lines = []
-    for start, text in tl[:40]:
-        mm = int(start // 60); ss = int(start % 60)
-        lines.append(f"[{mm:02d}:{ss:02d}] {text}")
-    if len(tl) > 40:
-        lines.append("… (truncated)")
-    return "\n".join(lines)
 
 # =========================
 # UI – one-click flow
@@ -379,14 +389,17 @@ with st.sidebar:
     target_minutes = st.slider("Target read length (minutes)", 5, 25, 12, 1)
     include_ts = st.checkbox("Include timestamps when possible", value=True)
     extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
-    model_choice = st.selectbox("Model", ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1"], index=0)
+    # Default to gpt-4.1 as requested
+    model_choice = st.selectbox("Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
     temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
     tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)
 
+# Single input + single button
 url = st.text_input("Paste podcast / episode URL (YouTube best for auto-transcript):").strip()
-manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=160)
+manual = st.text_area("Or paste transcript manually (auto-used if URL fails):", height=140)
 
-go = st.button("Summarize & Play ▶️")
+# Bigger, mobile-friendly primary action
+go = st.button("Summarize & Play ▶️", use_container_width=True)
 
 # Simple in-app logger
 if "logs" not in st.session_state:
@@ -399,9 +412,10 @@ if go:
     st.session_state.logs = []  # reset
     transcript_text: Optional[str] = None
     timeline: Optional[List[Tuple[float, str]]] = None
+    episode_title: Optional[str] = None
 
     with st.status("Working…", expanded=True) as status:
-        # 1) Get transcript: URL → YT (primary) → yt-dlp fallback → manual
+        # 1) Get transcript: URL → YT API → yt-dlp fallback → manual
         if url:
             vid = extract_youtube_id(url)
             if vid:
@@ -417,13 +431,15 @@ if go:
                 except Exception as e:
                     log(f"[yt-transcript-api] Unexpected: {type(e).__name__}: {e}")
 
-                # Fallback: yt-dlp captions
+                # Fallback: yt-dlp captions + title
                 if not transcript_text:
                     try:
                         if yt_dlp is None:
                             raise RuntimeError("yt-dlp not installed")
-                        transcript_text, timeline = fetch_youtube_transcript_via_ytdlp(url)
+                        transcript_text, episode_title, timeline = fetch_info_and_captions_via_ytdlp(url)
                         log(f"[yt-dlp] captions OK – {len(transcript_text):,} chars.")
+                        if episode_title:
+                            log(f"Title: {episode_title}")
                     except Exception as e:
                         log(f"[yt-dlp] fallback failed: {type(e).__name__}: {e}")
             else:
@@ -456,6 +472,7 @@ if go:
                 temperature=temperature,
                 log=log
             )
+            log("Merging done. Running length fit…")
             summary_md = fit_summary_to_length(
                 raw_md=summary_md,
                 persona_prompt=persona,
@@ -464,43 +481,67 @@ if go:
                 temperature=temperature,
                 log=log
             )
-
-            log("Final merged summary ready.")
+            log("Final summary ready.")
         except Exception as e:
             status.update(label="Summarization failed", state="error")
             st.error(f"Summarization failed: {type(e).__name__}: {e}")
             st.stop()
 
-        # 3) Render summary
+        # 3) Render summary + download (title-aware filename)
         st.success("Summary")
         st.markdown(summary_md)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = slugify(episode_title or "roadscout-summary")
+        md_bytes = io.BytesIO(summary_md.encode("utf-8"))
+        st.download_button(
+            label="Download summary (.md)",
+            data=md_bytes,
+            file_name=f"{base}_{ts}.md",
+            mime="text/markdown"
+        )
 
-        # 4) Auto-generate audio summary
+        # 4) Auto-generate audio summary (multipart, no truncation)
         try:
-            log("Generating audio summary (TTS)…")
-            audio_bytes = tts_from_text(summary_md, voice=tts_voice, log=log)
-            st.audio(audio_bytes, format="audio/mp3")
+            log("Generating audio summary parts…")
+            parts = tts_multipart(summary_md, voice=tts_voice, log=log)
+
+            # Show inline players + per-part downloads
+            for i, (fname, audio_bytes) in enumerate(parts, 1):
+                st.audio(audio_bytes, format="audio/mp3")
+                st.download_button(
+                    f"Download Part {i} (.mp3)",
+                    data=audio_bytes,
+                    file_name=f"{base}_{ts}_part{i}.mp3",
+                    mime="audio/mpeg",
+                    key=f"dl_part_{i}"
+                )
+
+            # One-click ZIP for car rides
+            zip_mem = io.BytesIO()
+            with zipfile.ZipFile(zip_mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
+                for i, (fname, audio_bytes) in enumerate(parts, 1):
+                    zf.writestr(f"{base}_{ts}_part{i}.mp3", audio_bytes)
+            zip_mem.seek(0)
             st.download_button(
-                "Download audio summary (.mp3)",
-                data=audio_bytes,
-                file_name="roadscout_summary.mp3",
-                mime="audio/mpeg",
+                "Download all parts (.zip)",
+                data=zip_mem.read(),
+                file_name=f"{base}_{ts}.zip",
+                mime="application/zip"
             )
-            log("Audio ready.")
+
+            log("Audio parts ready.")
             status.update(label="Done", state="complete")
-        
         except Exception as e:
             log(f"TTS failed: {type(e).__name__}: {e}")
             status.update(label="Summary ready (audio failed)", state="complete")
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
 
-
-# Diagnostics
+# Diagnostics (collapsed by default for mobile sanity)
 with st.expander("Diagnostics (click to view logs)"):
     if st.session_state.logs:
         st.code("\n".join(st.session_state.logs))
     else:
-        st.write("No logs yet. Paste a URL or transcript and click **Summarize & Play ▶️**.")
+        st.write("No logs yet. Paste a URL or transcript and tap **Summarize & Play ▶️**.")
 
 # Footer
 st.caption("Notes: YouTube sometimes blocks transcripts (rate limits/region/captions off). For non-YouTube podcasts, paste transcript for now.")
