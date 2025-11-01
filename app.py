@@ -397,7 +397,7 @@ with st.sidebar:
         index=2
     )
     target_minutes = st.slider("Target read length (minutes)", 5, 25, 25, 1)
-    include_ts = st.checkbox("Include timestamps when possible", value=True)
+    include_ts = st.checkbox("Include timestamps when possible", value=False)
     extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
     model_choice = st.selectbox("Merge/Fit Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
     speed_mode = st.checkbox("Speed mode (use gpt-4o-mini for per-chunk)", value=True)
