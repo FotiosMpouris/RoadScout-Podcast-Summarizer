@@ -36,42 +36,40 @@ youtube-transcript-api>=0.6.2
 yt-dlp>=2024.10.7
 requests>=2.31
 pydub>=0.25.1
-code
-Code
+
 #### `packages.txt`
 (Installs ffmpeg in Streamlit Cloud for MP3 stitching)
 ffmpeg
-code
-Code
 ## Run
-
 Open the deployed app, paste a YouTube URL (or a transcript), hit “Summarize & Play ▶️”.
 
 ## Running Locally
 1) Clone repo, then create and activate a virtual environment
 python -m venv .venv
 source .venv/bin/activate # On Windows: .venv\Scripts\activate
+
 2) Install dependencies
 pip install -r requirements.txt
+
 3) Set your API key
 export OPENAI_API_KEY="sk-..." # On Windows PowerShell: $env:OPENAI_API_KEY="sk-..."
+
 4) Ensure ffmpeg is installed and available in your system's PATH
 macOS (Homebrew): brew install ffmpeg
 Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y ffmpeg
 Windows: Install from ffmpeg.org and add the bin directory to your PATH
+
 5) Run the app
 streamlit run app.py
-code
-Code
+
 ## Project Structure
-.
+
 ├─ app.py # Streamlit UI + workflow
 ├─ prompts.py # build_persona_prompt(style, target_minutes, …)
 ├─ audio_utils.py # tts_to_single_mp3(): parallel TTS + stitch
 ├─ requirements.txt
 └─ packages.txt # ffmpeg (for Streamlit Cloud)
-code
-Code
+
 ## How It Works (Pipeline)
 
 1.  **Transcript Acquisition**
