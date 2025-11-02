@@ -1,26 +1,19 @@
-# RoadScout — Podcast/YouTube Summarizer with One-Click Audio
-
+RoadScout — Podcast/YouTube Summarizer with One-Click Audio
 RoadScout turns long podcasts and YouTube videos into a clean, persona-driven markdown summary plus a single stitched MP3 you can stream or download for the commute.
-
--   **Auto-transcript (YouTube):** Tries `youtube-transcript-api` first, then falls back to `yt-dlp` + VTT.
--   **Smart summarization:** Per-chunk + merge/fitting to a target read time (defaults to `gpt-4.1`).
--   **One MP3:** Fast, parallel TTS then stitched in-memory to a single file (no “Part 1…N” clutter).
--   **Push Notifications:** Optional, real-time alerts sent to your phone via the free `ntfy.sh` service when a summary is complete.
--   **Groovy 1970s UI:** Bright gradient canvas + dark sidebar.
--   **Quality of life:** Recognizable filenames and a detailed diagnostics panel.
-
-## Quickstart (Streamlit Community Cloud)
-
-#### 1. Deploy the app
-
-Click “New app” → point to this repo → `app.py`.
-
-#### 2. Add secrets
-
+Auto-transcript (YouTube): Tries youtube-transcript-api first, then falls back to yt-dlp + VTT.
+Smart summarization: Per-chunk + merge/fitting to a target read time (defaults to gpt-4.1).
+One MP3: Fast, parallel TTS then stitched in-memory to a single file (no “Part 1…N” clutter).
+Push Notifications: Optional, real-time alerts sent to your phone via the free ntfy.sh service when a summary is complete.
+Groovy 1970s UI: Bright gradient canvas + dark sidebar.
+Quality of life: Recognizable filenames and a detailed diagnostics panel.
+Quickstart (Streamlit Community Cloud)
+1. Deploy the app
+Click “New app” → point to this repo → app.py.
+2. Add secrets
 In Streamlit Cloud: App → Settings → Secrets.
 Paste your OpenAI API key:
-
-```toml
+code
+Toml
 # .streamlit/secrets.toml (Cloud UI only)
 OPENAI_API_KEY = "sk-...your key..."
 You can also set OPENAI_API_KEY as an environment variable locally.
