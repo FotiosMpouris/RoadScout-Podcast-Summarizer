@@ -42,11 +42,6 @@ try:
 except Exception as e:
     st.error(f"Could not import prompts.py: {e}")
     st.stop()
-# ---- Twilio for SMS notifications ----
-try:
-    from twilio.rest import Client as TwilioClient
-except ImportError:
-    TwilioClient = None # Degrade gracefully if not installed
 
 # =========================
 # App Config + '70s Theme
@@ -417,42 +412,6 @@ SUMMARY TO ADJUST:
     )
     return resp.choices[0].message.content.strip()
 
-def send_sms_notification(to_number: str, episode_title: Optional[str]):
-    """Sends an SMS using Twilio credentials stored in st.secrets."""
-    if TwilioClient is None:
-        log("Twilio SDK not installed. Skipping SMS.")
-        return
-
-    # Fetch all secrets at once
-    sid = st.secrets.get("TWILIO_ACCOUNT_SID")
-    token = st.secrets.get("TWILIO_AUTH_TOKEN")
-    from_num = st.secrets.get("TWILIO_PHONE_NUMBER")
-
-    if not all([sid, token, from_num]):
-        log("Twilio secrets are missing. Cannot send SMS.")
-        st.warning("Twilio secrets are not configured. Cannot send SMS.")
-        return
-
-    if not to_number.strip().startswith("+"):
-        log(f"Invalid phone number format provided: {to_number}. Skipping SMS.")
-        st.warning(f"The phone number must be in E.164 format (start with +). SMS not sent.")
-        return
-
-    try:
-        client = TwilioClient(sid, token)
-        title_text = f'"{episode_title}"' if episode_title else "your summary"
-        message = client.messages.create(
-            to=to_number.strip(),
-            from_=from_num,
-            body=f"✅ Your RoadScout summary for {title_text} is ready!"
-        )
-        log(f"SMS notification sent to ...{to_number.strip()[-4:]} (SID: {message.sid})")
-        st.success(f"SMS notification sent to your number!")
-    except Exception as e:
-        # Log the error but don't stop the app
-        log(f"Failed to send SMS: {e}")
-        st.error(f"Failed to send SMS. Please check the logs and your Twilio setup.")
-
 # ---------- FULL-LENGTH AUDIO (multipart + parallel) ----------
 # =========================
 # Sidebar – controls
@@ -469,18 +428,7 @@ with st.sidebar:
     extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
     model_choice = st.selectbox("Merge/Fit Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
     speed_mode = st.checkbox("Speed mode (use gpt-4o-mini for per-chunk)", value=True)
-    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
-    # --- SMS Notification Controls ---
-    st.markdown("---") # Adds a visual separator line
-    notify_via_sms = st.checkbox("Send SMS alert when complete?")
-    
-    sms_notify_number = "" # Initialize an empty variable for the phone number
-    if notify_via_sms:
-        sms_notify_number = st.text_input(
-            "Phone number to notify",
-            placeholder="+15551234567",
-            help="Enter your personal phone number in E.164 format (e.g., +15551234567). This must be a number you have verified in your Twilio account."
-        )
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)      
     tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)    
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -621,9 +569,7 @@ if go:
             )
 
             
-            if notify_via_sms and sms_notify_number:
-                send_sms_notification(sms_notify_number, episode_title)
-            
+                        
             status.update(label="Done", state="complete")
 
             
