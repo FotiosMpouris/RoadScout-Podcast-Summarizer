@@ -62,14 +62,6 @@ Windows: Install from ffmpeg.org and add the bin directory to your PATH
 5) Run the app
 streamlit run app.py
 
-## Project Structure
-
-.
-├─ app.py # Streamlit UI + workflow
-├─ prompts.py # build_persona_prompt(style, target_minutes, …)
-├─ audio_utils.py # tts_to_single_mp3(): parallel TTS + stitch
-├─ requirements.txt
-└─ packages.txt # ffmpeg (for Streamlit Cloud)
 
 ## How It Works (Pipeline)
 
