@@ -412,6 +412,25 @@ SUMMARY TO ADJUST:
     )
     return resp.choices[0].message.content.strip()
 
+def send_ntfy_notification(topic: str, episode_title: Optional[str]):
+    """Sends a push notification using the free ntfy.sh service."""
+    try:
+        title_text = f'"{episode_title}"' if episode_title else "Your summary"
+        requests.post(
+            f"https://ntfy.sh/{topic}",
+            data=f"Your RoadScout summary for {title_text} is ready!".encode(encoding='utf-8'),
+            headers={
+                "Title": "✅ RoadScout Summary Ready!",
+                "Priority": "high",
+                "Tags": "tada"
+            }
+        )
+        log("ntfy push notification sent.")
+        st.success("Push notification sent to your device!")
+    except Exception as e:
+        log(f"Failed to send ntfy notification: {e}")
+        st.warning("Could not send push notification.")
+
 # ---------- FULL-LENGTH AUDIO (multipart + parallel) ----------
 # =========================
 # Sidebar – controls
@@ -428,7 +447,18 @@ with st.sidebar:
     extra_focus = st.text_input("Optional focus areas (comma-separated)", value="regulatory risk, compute constraints")
     model_choice = st.selectbox("Merge/Fit Model", ["gpt-4.1", "gpt-4.1-mini", "gpt-4o-mini"], index=0)
     speed_mode = st.checkbox("Speed mode (use gpt-4o-mini for per-chunk)", value=True)
-    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)      
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, 0.05)
+    # --- Push Notification Controls ---
+    st.markdown("---")
+    notify_via_push = st.checkbox("Send push notification when complete?")
+    
+    ntfy_topic = ""
+    if notify_via_push:
+        ntfy_topic = st.text_input(
+            "Your ntfy.sh topic name",
+            value="roadscout-alerts-pizzatime99", # Pre-filled for convenience
+            help="Enter the secret topic you subscribed to in the ntfy app."
+        )
     tts_voice = st.selectbox("TTS Voice", ["alloy", "verse", "amber", "sage"], index=0)    
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -568,7 +598,8 @@ if go:
                 use_container_width=True,
             )
 
-            
+            if notify_via_push and ntfy_topic:
+                send_ntfy_notification(ntfy_topic.strip(), episode_title)
                         
             status.update(label="Done", state="complete")
 
@@ -576,9 +607,13 @@ if go:
             st.session_state.logs.append("Single MP3 ready.")
 
         except Exception as e:
+            if notify_via_push and ntfy_topic:
+                send_ntfy_notification(ntfy_topic.strip(), episode_title)
             status.update(label="Summary ready (audio failed)", state="complete")
             st.warning(f"TTS failed: {type(e).__name__}: {e}")
             st.session_state.logs.append(f"TTS failed: {type(e).__name__}: {e}")
+
+        
                    
 
 # Diagnostics
