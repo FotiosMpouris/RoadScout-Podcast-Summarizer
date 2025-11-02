@@ -418,9 +418,9 @@ def send_ntfy_notification(topic: str, episode_title: Optional[str]):
         title_text = f'"{episode_title}"' if episode_title else "Your summary"
         requests.post(
             f"https://ntfy.sh/{topic}",
-            data=f"Your RoadScout summary for {title_text} is ready!".encode(encoding='utf-8'),
+            data=f"✅ Your RoadScout summary for {title_text} is ready!".encode(encoding='utf-8'),
             headers={
-                "Title": "✅ RoadScout Summary Ready!",
+                "Title": "RoadScout Summary Ready!",
                 "Priority": "high",
                 "Tags": "tada"
             }
