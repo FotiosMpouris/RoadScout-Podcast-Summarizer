@@ -1,5 +1,3 @@
-code
-Markdown
 # RoadScout — Podcast/YouTube Summarizer with One-Click Audio
 
 RoadScout turns long podcasts and YouTube videos into a clean, persona-driven markdown summary plus a single stitched MP3 you can stream or download for the commute.
@@ -121,6 +119,4 @@ Summarization: OpenAI (gpt-4.1, gpt-4o-mini)
 Text-to-speech: OpenAI
 Audio stitching: pydub + ffmpeg
 Notifications: ntfy.sh
-UI: Streamlit (with a splash of 1970s flare 🌈)
-code
-Code
+UI: Streamlit (with a splash of 1970s flare)
