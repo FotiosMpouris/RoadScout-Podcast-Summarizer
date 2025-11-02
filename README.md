@@ -64,6 +64,7 @@ streamlit run app.py
 
 ## Project Structure
 
+.
 ├─ app.py # Streamlit UI + workflow
 ├─ prompts.py # build_persona_prompt(style, target_minutes, …)
 ├─ audio_utils.py # tts_to_single_mp3(): parallel TTS + stitch
@@ -135,4 +136,4 @@ MIT — feel free to adapt to your needs.
 -   **Text-to-speech:** OpenAI
 -   **Audio stitching:** `pydub` + `ffmpeg`
 -   **Notifications:** `ntfy.sh`
--   **UI:** Streamlit (with a splash of 1970s flare 🌈)
+-   **UI:** Streamlit (with a splash of 1970s flare)
